@@ -2,22 +2,22 @@ input:
   - test_cloud.xyz
 
 pipeline:
-  - step: Filter
+  - step: filter
     params:
       type: statistical
       k: 20
       std_ratio: 1.5
 
-  - step: Downsample
+  - step: downsample
     params:
       type: voxel
-      size: 0.1
+      voxel_size: 0.1
 
-  - step: Normals
+  - step: normals
     params:
       k: 15
 
-  - step: Reconstruct
+  - step: reconstruct
     params:
       type: poisson
       depth: 6

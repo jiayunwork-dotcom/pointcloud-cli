@@ -34,6 +34,138 @@ impl PipelineEngine {
         Self::default()
     }
 
+    pub fn dry_run_from_config(&self, config: &PipelineConfig) -> Result<()> {
+        println!();
+        println!("{}", "=".repeat(70));
+        println!("Pipeline 试运行 (Dry-Run) - 不执行实际处理");
+        println!("{}", "=".repeat(70));
+        println!();
+
+        println!("【配置解析】");
+        println!("  输出路径模板:   {}", config.output);
+        println!("  输出中间文件:   {}", if config.output_intermediate { "是" } else { "否" });
+        if let Some(d) = &config.output_dir {
+            println!("  输出目录:       {}", d);
+        }
+        if let Some(r) = &config.report_path {
+            println!("  报告输出路径:   {}", r);
+        }
+        println!();
+
+        println!("【输入文件校验】");
+        let mut all_exist = true;
+        let mut missing_files = Vec::new();
+
+        for p in &config.input {
+            let path = std::path::PathBuf::from(p);
+            if path.exists() {
+                if path.is_file() {
+                    let meta = std::fs::metadata(&path).ok();
+                    let size_str = match meta {
+                        Some(m) => format_bytes(m.len()),
+                        None => "-".to_string(),
+                    };
+                    println!("  ✓ 文件存在: {} ({})", p, size_str);
+                } else if path.is_dir() {
+                    match find_point_cloud_files(&path) {
+                        Ok(files) => {
+                            println!("  ✓ 目录存在: {} (内含 {} 个点云文件)", p, files.len());
+                            for f in &files {
+                                println!("      - {}", f.display());
+                            }
+                        }
+                        Err(e) => {
+                            println!("  ✗ 目录读取失败: {} ({})", p, e);
+                            all_exist = false;
+                            missing_files.push(p.clone());
+                        }
+                    }
+                }
+            } else {
+                println!("  ✗ 文件不存在: {}", p);
+                all_exist = false;
+                missing_files.push(p.clone());
+            }
+        }
+
+        if let Some(dir) = &config.input_dir {
+            let dir_path = std::path::PathBuf::from(dir);
+            if dir_path.is_dir() {
+                match find_point_cloud_files(&dir_path) {
+                    Ok(files) => {
+                        println!("  ✓ 输入目录存在: {} (内含 {} 个点云文件)", dir, files.len());
+                        for f in &files {
+                            println!("      - {}", f.display());
+                        }
+                    }
+                    Err(e) => {
+                        println!("  ✗ 输入目录读取失败: {} ({})", dir, e);
+                        all_exist = false;
+                    }
+                }
+            } else {
+                println!("  ✗ 输入目录不存在: {}", dir);
+                all_exist = false;
+            }
+        }
+        println!();
+
+        let input_files = self.collect_input_files(config)?;
+        println!("  共计 {} 个待处理文件", input_files.len());
+        if input_files.is_empty() {
+            println!("  ⚠ 警告: 未找到任何输入文件，实际运行将报错!");
+        }
+        println!();
+
+        println!("【Pipeline 步骤列表】 (共 {} 步)", config.pipeline.len());
+        println!("{:-<70}", "");
+        for (idx, step) in config.pipeline.iter().enumerate() {
+            let step_desc = describe_step(step);
+            println!("  [{:>2}] {}", idx + 1, step_desc);
+        }
+        println!("{:-<70}", "");
+        println!();
+
+        if let Some(dir) = &config.output_dir {
+            println!("【输出预览】");
+            let output_dir = std::path::PathBuf::from(dir);
+            for input_path in &input_files {
+                let stem = input_path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("output");
+                let resolved = self.resolve_output_path(
+                    &config.output,
+                    &output_dir,
+                    stem,
+                );
+                println!("  {}  →  {}", input_path.display(), resolved.display());
+            }
+            println!();
+        }
+
+        if !missing_files.is_empty() {
+            println!("⚠ 配置校验未通过，缺失 {} 个输入项:", missing_files.len());
+            for m in &missing_files {
+                println!("  - {}", m);
+            }
+            println!();
+            return Err(PointCloudError::ConfigError(
+                format!("试运行发现 {} 个缺失的输入项，请检查配置", missing_files.len())
+            ));
+        } else if input_files.is_empty() {
+            println!("⚠ 配置校验未通过: 未找到任何输入文件");
+            println!();
+            return Err(PointCloudError::ConfigError(
+                "试运行发现没有可处理的输入文件".to_string()
+            ));
+        } else {
+            println!("✓ 配置校验通过，{} 个文件就绪，可执行实际 Pipeline。", input_files.len());
+            println!();
+        }
+
+        Ok(())
+    }
+
     pub fn run_from_config(&self, config: &PipelineConfig) -> Result<PipelineReport> {
         let start_total = Instant::now();
 
@@ -626,6 +758,140 @@ fn step_name(step: &PipelineStep) -> String {
         PipelineStep::Simplify { .. } => "Simplify".to_string(),
         PipelineStep::Smooth { .. } => "Smooth".to_string(),
         PipelineStep::Segment { .. } => "Segment".to_string(),
+    }
+}
+
+fn format_bytes(n: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let f = n as f64;
+    if f >= GB {
+        format!("{:.2} GB", f / GB)
+    } else if f >= MB {
+        format!("{:.2} MB", f / MB)
+    } else if f >= KB {
+        format!("{:.2} KB", f / KB)
+    } else {
+        format!("{} B", n)
+    }
+}
+
+fn describe_step(step: &PipelineStep) -> String {
+    match step {
+        PipelineStep::Filter { filter_type, k, std_ratio, radius, min_neighbors } => {
+            let mut desc = format!("Filter (类型: {})", filter_type);
+            match filter_type.as_str() {
+                "statistical" => {
+                    desc.push_str(&format!(", K={}, std_ratio={}",
+                        k.unwrap_or(30),
+                        std_ratio.unwrap_or(1.5)
+                    ));
+                }
+                "radius" => {
+                    desc.push_str(&format!(", radius={}, min_neighbors={}",
+                        radius.unwrap_or(0.1),
+                        min_neighbors.unwrap_or(5)
+                    ));
+                }
+                _ => {}
+            }
+            desc
+        }
+        PipelineStep::Downsample { downsample_type, voxel_size } => {
+            let mut desc = format!("Downsample (类型: {})", downsample_type);
+            if downsample_type == "voxel" {
+                desc.push_str(&format!(", voxel_size={}",
+                    voxel_size.unwrap_or(0.05)
+                ));
+            }
+            desc
+        }
+        PipelineStep::RemoveGround { initial_window, max_window, cell_size, slope_threshold, height_threshold, keep_only_non_ground } => {
+            format!("RemoveGround (initial_window={}, max_window={}, cell_size={}, keep_non_ground={})",
+                initial_window.unwrap_or(0.5),
+                max_window.unwrap_or(5.0),
+                cell_size.unwrap_or(1.0),
+                keep_only_non_ground.unwrap_or(true)
+            )
+        }
+        PipelineStep::Normals { k, orientation_k } => {
+            format!("Normals (K={}, orientation_k={})",
+                k.unwrap_or(20),
+                orientation_k.unwrap_or(10)
+            )
+        }
+        PipelineStep::Register { register_type, fpfh_radius, ransac_iterations, icp_iterations, icp_threshold } => {
+            format!("Register (类型: {}, FPFH_radius={}, ICP_iters={})",
+                register_type,
+                fpfh_radius.unwrap_or(0.15),
+                icp_iterations.unwrap_or(100)
+            )
+        }
+        PipelineStep::Reconstruct { reconstruct_type, depth, min_depth, ball_radius, resolution, iso_value } => {
+            let mut desc = format!("Reconstruct (类型: {})", reconstruct_type);
+            match reconstruct_type.as_str() {
+                "poisson" => {
+                    desc.push_str(&format!(", depth={}, min_depth={}",
+                        depth.unwrap_or(8),
+                        min_depth.unwrap_or(5)
+                    ));
+                }
+                "ball_pivoting" | "ball" => {
+                    desc.push_str(&format!(", ball_radius={}",
+                        ball_radius.unwrap_or(0.01)
+                    ));
+                }
+                "marching_cubes" | "mc" => {
+                    desc.push_str(&format!(", resolution={}, iso_value={}",
+                        resolution.unwrap_or(64),
+                        iso_value.unwrap_or(0.0)
+                    ));
+                }
+                _ => {}
+            }
+            desc
+        }
+        PipelineStep::FillHoles { max_hole_size } => {
+            format!("FillHoles (max_hole_size={})",
+                max_hole_size.unwrap_or(50)
+            )
+        }
+        PipelineStep::Simplify { simplify_type, target_faces, target_ratio } => {
+            let mut desc = format!("Simplify (类型: {})", simplify_type);
+            if let Some(tr) = target_ratio {
+                desc.push_str(&format!(", target_ratio={}", tr));
+            }
+            if let Some(tf) = target_faces {
+                desc.push_str(&format!(", target_faces={}", tf));
+            }
+            desc
+        }
+        PipelineStep::Smooth { smooth_type, iterations, lambda } => {
+            format!("Smooth (类型: {}, iterations={}, lambda={})",
+                smooth_type,
+                iterations.unwrap_or(20),
+                lambda.unwrap_or(0.5)
+            )
+        }
+        PipelineStep::Segment { segment_type, max_planes, plane_distance, cluster_tolerance, min_cluster_size } => {
+            let mut desc = format!("Segment (类型: {})", segment_type);
+            if segment_type == "planes" || segment_type == "euclidean" {
+                if segment_type == "planes" {
+                    desc.push_str(&format!(", max_planes={}, plane_dist={}",
+                        max_planes.unwrap_or(5),
+                        plane_distance.unwrap_or(0.02)
+                    ));
+                }
+                if let Some(ct) = cluster_tolerance {
+                    desc.push_str(&format!(", cluster_tol={}, min_cluster={}",
+                        ct,
+                        min_cluster_size.unwrap_or(100)
+                    ));
+                }
+            }
+            desc
+        }
     }
 }
 

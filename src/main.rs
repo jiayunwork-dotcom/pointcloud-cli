@@ -31,6 +31,20 @@ enum Commands {
 
         #[arg(short, long, help = "覆盖报告路径")]
         report: Option<PathBuf>,
+
+        #[arg(long, help = "试运行模式: 解析配置、校验文件、打印步骤但不执行")]
+        dry_run: bool,
+    },
+
+    Diff {
+        #[arg(help = "第一份Pipeline报告 (JSON)")]
+        report_a: PathBuf,
+
+        #[arg(help = "第二份Pipeline报告 (JSON)")]
+        report_b: PathBuf,
+
+        #[arg(long, help = "以JSON格式输出差异结果")]
+        json: bool,
     },
 
     Info {
@@ -62,6 +76,9 @@ enum Commands {
 
         #[arg(long, help = "Marching Cubes分辨率 (默认64)")]
         mc_resolution: Option<u32>,
+
+        #[arg(long, help = "输出转换统计摘要到stderr (文件大小、精度损失、包围盒)")]
+        stats: bool,
     },
 
     Batch {
@@ -149,10 +166,11 @@ fn main() {
     }
 
     let result = match cli.command {
-        Commands::Run { config, output, report } => run_pipeline(&config, output, report),
+        Commands::Run { config, output, report, dry_run } => run_pipeline(&config, output, report, dry_run),
+        Commands::Diff { report_a, report_b, json } => run_diff(&report_a, &report_b, json),
         Commands::Info { input } => show_info(&input),
-        Commands::Convert { input, output, filter, downsample, normals, reconstruct, poisson_depth, mc_resolution }
-            => do_convert(&input, &output, filter, downsample, normals, reconstruct, poisson_depth, mc_resolution),
+        Commands::Convert { input, output, filter, downsample, normals, reconstruct, poisson_depth, mc_resolution, stats }
+            => do_convert(&input, &output, filter, downsample, normals, reconstruct, poisson_depth, mc_resolution, stats),
         Commands::Batch { input_dir, output_dir, config } => do_batch(&input_dir, &output_dir, config),
         Commands::Measure { action } => do_measurement(action),
         Commands::ExampleConfig { output } => write_example_config(output),
@@ -165,7 +183,7 @@ fn main() {
     }
 }
 
-fn run_pipeline(config_path: &Path, output_override: Option<PathBuf>, report_override: Option<PathBuf>) -> Result<()> {
+fn run_pipeline(config_path: &Path, output_override: Option<PathBuf>, report_override: Option<PathBuf>, dry_run: bool) -> Result<()> {
     log::info!("加载配置: {}", config_path.display());
     let mut config = config::PipelineConfig::from_yaml_file(config_path)?;
 
@@ -177,8 +195,37 @@ fn run_pipeline(config_path: &Path, output_override: Option<PathBuf>, report_ove
     }
 
     let engine = pipeline::PipelineEngine::new();
-    let report = engine.run_from_config(&config)?;
-    report.print_summary();
+
+    if dry_run {
+        engine.dry_run_from_config(&config)?;
+    } else {
+        let report = engine.run_from_config(&config)?;
+        report.print_summary();
+    }
+
+    Ok(())
+}
+
+fn run_diff(report_a_path: &Path, report_b_path: &Path, as_json: bool) -> Result<()> {
+    log::info!("加载报告 A: {}", report_a_path.display());
+    let report_a = report::PipelineReport::load_from_json(report_a_path)?;
+
+    log::info!("加载报告 B: {}", report_b_path.display());
+    let report_b = report::PipelineReport::load_from_json(report_b_path)?;
+
+    let diff = report::diff_reports(
+        &report_a,
+        &report_b,
+        &report_a_path.to_string_lossy(),
+        &report_b_path.to_string_lossy(),
+    );
+
+    if as_json {
+        let json = diff.to_json_pretty()?;
+        println!("{}", json);
+    } else {
+        diff.print_table();
+    }
 
     Ok(())
 }
@@ -216,6 +263,74 @@ fn show_info(input: &Path) -> Result<()> {
     Ok(())
 }
 
+fn detect_format_float_precision(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    match ext.as_str() {
+        "ply" => {
+            let mut file = match std::fs::File::open(path) {
+                Ok(f) => f,
+                Err(_) => return None,
+            };
+            let mut reader = std::io::BufReader::new(&mut file);
+            let mut line = String::new();
+            let mut float_type: Option<&'static str> = None;
+            loop {
+                line.clear();
+                let n = match std::io::BufRead::read_line(&mut reader, &mut line) {
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                if n == 0 { break; }
+                let trimmed = line.trim();
+                if trimmed == "end_header" { break; }
+                if trimmed.starts_with("property ") && (trimmed.contains(" x") || trimmed.contains(" y") || trimmed.contains(" z")) {
+                    if trimmed.contains("float64") || trimmed.contains("double") {
+                        float_type = Some("float64");
+                        break;
+                    } else if trimmed.contains("float32") || trimmed.contains("float ") {
+                        float_type = Some("float32");
+                        break;
+                    }
+                }
+            }
+            float_type
+        }
+        "xyz" => Some("float64 (ascii)"),
+        "pcd" => Some("float32"),
+        "las" | "laz" => Some("int32_scaled"),
+        "obj" | "stl" => Some("float64 (ascii/混合)"),
+        _ => None,
+    }
+}
+
+fn bbox_almost_equal(a: &types::AABB, b: &types::AABB, eps: f64) -> bool {
+    (a.min.x - b.min.x).abs() < eps
+        && (a.min.y - b.min.y).abs() < eps
+        && (a.min.z - b.min.z).abs() < eps
+        && (a.max.x - b.max.x).abs() < eps
+        && (a.max.y - b.max.y).abs() < eps
+        && (a.max.z - b.max.z).abs() < eps
+}
+
+fn format_stats_bytes(n: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let f = n as f64;
+    if f >= GB {
+        format!("{:.2} GB ({})", f / GB, n)
+    } else if f >= MB {
+        format!("{:.2} MB ({})", f / MB, n)
+    } else if f >= KB {
+        format!("{:.2} KB ({})", f / KB, n)
+    } else {
+        format!("{} B", n)
+    }
+}
+
 fn do_convert(
     input: &Path,
     output: &Path,
@@ -225,6 +340,7 @@ fn do_convert(
     recon: Option<ReconAlgo>,
     poisson_depth: Option<u32>,
     mc_resolution: Option<u32>,
+    enable_stats: bool,
 ) -> Result<()> {
     use reconstruction::*;
     use preprocess::*;
@@ -233,11 +349,17 @@ fn do_convert(
     let reader = io::PointCloudReader::new();
     let mesh_writer = io::MeshWriter::new();
 
+    let input_size = std::fs::metadata(input).ok().map(|m| m.len());
+    let input_precision = detect_format_float_precision(input);
+    let input_bbox_orig: Option<types::AABB>;
+
     let total_start = std::time::Instant::now();
     log::info!("读取: {}", input.display());
     let mut pc = reader.read(input)?;
     let initial = pc.len();
     log::info!("  共 {} 点", initial);
+
+    input_bbox_orig = pc.summary().map(|s| s.bounding_box);
 
     if do_filter {
         log::info!("统计滤波去噪...");
@@ -270,6 +392,10 @@ fn do_convert(
         pc = result.point_cloud;
     }
 
+    let output_bbox_after_processing: Option<types::AABB> =
+        pc.summary().map(|s| s.bounding_box);
+    let output_points_count = pc.len();
+
     if need_reconstruct {
         let recon = recon.unwrap();
         log::info!("表面重建 ({:?})...", recon);
@@ -283,6 +409,7 @@ fn do_convert(
         let mcp = MarchingCubesParams { resolution: mc_resolution.unwrap_or(64), ..Default::default() };
 
         let mesh = reconstruct_surface(&pc, algorithm, &pp, &bp, &mcp)?;
+        let mesh_bbox = mesh.aabb();
         log::info!("  生成: {} 顶点, {} 面片", mesh.vertex_count(), mesh.face_count());
 
         if let Some(parent) = output.parent() {
@@ -292,6 +419,9 @@ fn do_convert(
         mesh_writer.write(&mesh, output)?;
         log::info!("已写入网格: {}", output.display());
 
+        let output_size = std::fs::metadata(output).ok().map(|m| m.len());
+        let output_precision = detect_format_float_precision(output);
+
         let elapsed = total_start.elapsed();
         println!("\n处理完成!");
         println!("  初始点数:   {}", initial);
@@ -299,6 +429,77 @@ fn do_convert(
             pc.len(), mesh.vertex_count(), mesh.face_count()
         );
         println!("  总耗时:     {:.2}s", elapsed.as_secs_f64());
+
+        if enable_stats {
+            eprintln!();
+            eprintln!("{}", "=".repeat(60));
+            eprintln!("转换统计摘要 (stderr)");
+            eprintln!("{}", "=".repeat(60));
+            eprintln!("【文件大小】");
+            eprintln!("  输入: {}",
+                input_size.map(format_stats_bytes).unwrap_or_else(|| "-".to_string()));
+            eprintln!("  输出: {}",
+                output_size.map(format_stats_bytes).unwrap_or_else(|| "-".to_string()));
+            if let (Some(is), Some(os)) = (input_size, output_size) {
+                let ratio = if is > 0 {
+                    os as f64 / is as f64
+                } else { 0.0 };
+                let delta = os as i64 - is as i64;
+                eprintln!("  变化: {:+} bytes ({:+.2}x)",
+                    delta, ratio);
+            }
+            eprintln!();
+            eprintln!("【精度分析】");
+            eprintln!("  输入精度:   {}", input_precision.unwrap_or("未知"));
+            eprintln!("  输出精度:   {}", output_precision.unwrap_or("未知"));
+            let mut precision_loss_notes: Vec<&str> = Vec::new();
+            match (input_precision, output_precision) {
+                (Some(i), Some(o)) => {
+                    if i.contains("64") && (o.contains("32") || o == "float32") {
+                        precision_loss_notes.push("float64 → float32 可能存在数值截断");
+                    }
+                    if (i.contains("64") || i.contains("ascii")) && o.contains("32_scaled") {
+                        precision_loss_notes.push("浮点 → 整数缩放编码 存在精度损失");
+                    }
+                }
+                _ => {}
+            }
+            precision_loss_notes.push("表面重建是近似过程，不复原始点");
+            let _ = recon;
+            if precision_loss_notes.is_empty() {
+                eprintln!("  精度损失:   无（无损或格式兼容）");
+            } else {
+                eprintln!("  精度损失:   有");
+                for note in precision_loss_notes {
+                    eprintln!("    ⚠ {}", note);
+                }
+            }
+            eprintln!();
+            eprintln!("【包围盒对比】");
+            match (input_bbox_orig, mesh_bbox.or(output_bbox_after_processing)) {
+                (Some(orig), Some(out)) => {
+                    let eps = 1e-6;
+                    let eq = bbox_almost_equal(&orig, &out, eps);
+                    eprintln!("  输入包围盒:");
+                    eprintln!("    min=({:.6}, {:.6}, {:.6})",
+                        orig.min.x, orig.min.y, orig.min.z);
+                    eprintln!("    max=({:.6}, {:.6}, {:.6})",
+                        orig.max.x, orig.max.y, orig.max.z);
+                    eprintln!("  输出包围盒:");
+                    eprintln!("    min=({:.6}, {:.6}, {:.6})",
+                        out.min.x, out.min.y, out.min.z);
+                    eprintln!("    max=({:.6}, {:.6}, {:.6})",
+                        out.max.x, out.max.y, out.max.z);
+                    eprintln!("  一致性: {}",
+                        if eq { "✓ 完全一致" } else { "✗ 存在差异（滤波/重建等原因）" });
+                }
+                _ => {
+                    eprintln!("  无法对比包围盒信息");
+                }
+            }
+            eprintln!("{}", "=".repeat(60));
+            eprintln!();
+        }
     } else {
         if let Some(parent) = output.parent() {
             std::fs::create_dir_all(parent).ok();
@@ -321,10 +522,85 @@ fn do_convert(
             }
         }
 
+        let output_size = std::fs::metadata(output).ok().map(|m| m.len());
+        let output_precision = detect_format_float_precision(output);
+        let output_pc = reader.read(output).ok();
+        let output_bbox_final = output_pc.as_ref().and_then(|p| p.summary().map(|s| s.bounding_box));
+
         let elapsed = total_start.elapsed();
         println!("\n格式转换完成!");
         println!("  点数:       {}", pc.len());
         println!("  总耗时:     {:.2}s", elapsed.as_secs_f64());
+
+        if enable_stats {
+            eprintln!();
+            eprintln!("{}", "=".repeat(60));
+            eprintln!("转换统计摘要 (stderr)");
+            eprintln!("{}", "=".repeat(60));
+            eprintln!("【文件大小】");
+            eprintln!("  输入: {}",
+                input_size.map(format_stats_bytes).unwrap_or_else(|| "-".to_string()));
+            eprintln!("  输出: {}",
+                output_size.map(format_stats_bytes).unwrap_or_else(|| "-".to_string()));
+            if let (Some(is), Some(os)) = (input_size, output_size) {
+                let ratio = if is > 0 {
+                    os as f64 / is as f64
+                } else { 0.0 };
+                let delta = os as i64 - is as i64;
+                eprintln!("  变化: {:+} bytes ({:+.2}x)",
+                    delta, ratio);
+            }
+            eprintln!();
+            eprintln!("【精度分析】");
+            eprintln!("  输入精度:   {}", input_precision.unwrap_or("未知"));
+            eprintln!("  输出精度:   {}", output_precision.unwrap_or("未知"));
+            let mut precision_loss_notes: Vec<&str> = Vec::new();
+            match (input_precision, output_precision) {
+                (Some(i), Some(o)) => {
+                    if i.contains("64") && (o.contains("32") || o == "float32") {
+                        precision_loss_notes.push("float64 → float32 可能存在数值截断");
+                    }
+                    if (i.contains("64") || i.contains("ascii")) && o.contains("32_scaled") {
+                        precision_loss_notes.push("浮点 → 整数缩放编码 存在精度损失");
+                    }
+                }
+                _ => {}
+            }
+            if precision_loss_notes.is_empty() {
+                eprintln!("  精度损失:   无（无损或格式兼容）");
+            } else {
+                eprintln!("  精度损失:   有");
+                for note in precision_loss_notes {
+                    eprintln!("    ⚠ {}", note);
+                }
+            }
+            eprintln!();
+            eprintln!("【包围盒对比】 (点数: {} → {})",
+                initial, output_points_count);
+            match (input_bbox_orig, output_bbox_final.or(output_bbox_after_processing)) {
+                (Some(orig), Some(out)) => {
+                    let eps = 1e-6;
+                    let eq = bbox_almost_equal(&orig, &out, eps);
+                    eprintln!("  输入包围盒:");
+                    eprintln!("    min=({:.6}, {:.6}, {:.6})",
+                        orig.min.x, orig.min.y, orig.min.z);
+                    eprintln!("    max=({:.6}, {:.6}, {:.6})",
+                        orig.max.x, orig.max.y, orig.max.z);
+                    eprintln!("  输出包围盒:");
+                    eprintln!("    min=({:.6}, {:.6}, {:.6})",
+                        out.min.x, out.min.y, out.min.z);
+                    eprintln!("    max=({:.6}, {:.6}, {:.6})",
+                        out.max.x, out.max.y, out.max.z);
+                    eprintln!("  一致性: {}",
+                        if eq { "✓ 完全一致" } else { "✗ 存在差异（滤波/降采样原因）" });
+                }
+                _ => {
+                    eprintln!("  无法对比包围盒信息");
+                }
+            }
+            eprintln!("{}", "=".repeat(60));
+            eprintln!();
+        }
     }
 
     Ok(())
