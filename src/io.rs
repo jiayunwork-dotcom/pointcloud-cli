@@ -966,3 +966,399 @@ pub fn find_point_cloud_files(dir: &Path) -> Result<Vec<PathBuf>> {
     result.sort();
     Ok(result)
 }
+
+pub struct MeshReader;
+
+impl MeshReader {
+    pub fn new() -> Self { MeshReader }
+
+    pub fn read(&self, path: &Path) -> Result<Mesh> {
+        let format = crate::utils::detect_mesh_format(path)?;
+        match format {
+            MeshFormat::PLY => self.read_ply(path),
+            MeshFormat::OBJ => self.read_obj(path),
+            MeshFormat::STL => self.read_stl(path),
+        }
+    }
+
+    pub fn read_ply(&self, path: &Path) -> Result<Mesh> {
+        let file = File::open(path)?;
+        let mut reader = BufReader::new(file);
+
+        let mut line = String::new();
+        let mut format_str = "ascii".to_string();
+        let mut vertex_count = 0usize;
+        let mut face_count = 0usize;
+        let mut vertex_properties: Vec<String> = Vec::new();
+        let mut in_vertex = false;
+        let mut in_face = false;
+
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line)?;
+            if n == 0 { break; }
+            let trimmed = line.trim();
+
+            if trimmed == "ply" { continue; }
+            if trimmed.starts_with("format") {
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    format_str = parts[1].to_string();
+                }
+            } else if trimmed.starts_with("element vertex") {
+                in_vertex = true;
+                in_face = false;
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.len() >= 3 {
+                    vertex_count = parts[2].parse().unwrap_or(0);
+                }
+            } else if trimmed.starts_with("element face") {
+                in_vertex = false;
+                in_face = true;
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.len() >= 3 {
+                    face_count = parts[2].parse().unwrap_or(0);
+                }
+            } else if trimmed.starts_with("element") {
+                in_vertex = false;
+                in_face = false;
+            } else if trimmed.starts_with("property") && in_vertex {
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.len() >= 3 {
+                    vertex_properties.push(parts[2].to_string());
+                }
+            } else if trimmed == "end_header" {
+                break;
+            }
+        }
+
+        let has_x = vertex_properties.iter().any(|p| p == "x");
+        let has_y = vertex_properties.iter().any(|p| p == "y");
+        let has_z = vertex_properties.iter().any(|p| p == "z");
+        let has_nx = vertex_properties.iter().any(|p| p == "nx");
+        let has_ny = vertex_properties.iter().any(|p| p == "ny");
+        let has_nz = vertex_properties.iter().any(|p| p == "nz");
+        let has_red = vertex_properties.iter().any(|p| p == "red");
+        let has_green = vertex_properties.iter().any(|p| p == "green");
+        let has_blue = vertex_properties.iter().any(|p| p == "blue");
+
+        if !has_x || !has_y || !has_z {
+            return Err(PointCloudError::ParseError("PLY文件缺少x/y/z字段".into()));
+        }
+
+        let mut vertices: Vec<Vertex> = Vec::with_capacity(vertex_count);
+        let mut faces: Vec<TriangleFace> = Vec::with_capacity(face_count);
+
+        match format_str.as_str() {
+            "ascii" => {
+                for _ in 0..vertex_count {
+                    let mut line = String::new();
+                    reader.read_line(&mut line)?;
+                    let parts: Vec<&str> = line.trim().split_whitespace().collect();
+                    let mut pi = 0;
+
+                    let x: f64 = parts.get(pi).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                    pi += if has_x { 1 } else { 0 };
+                    let y: f64 = parts.get(pi).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                    pi += if has_y { 1 } else { 0 };
+                    let z: f64 = parts.get(pi).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                    pi += if has_z { 1 } else { 0 };
+
+                    let normal = if has_nx && has_ny && has_nz {
+                        let nx: f64 = parts.get(pi).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                        let ny: f64 = parts.get(pi + 1).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                        let nz: f64 = parts.get(pi + 2).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                        Some(nalgebra::Vector3::new(nx, ny, nz))
+                    } else { None };
+
+                    let color = if has_red && has_green && has_blue {
+                        let cidx = pi + if has_nx && has_ny && has_nz { 3 } else { 0 };
+                        let r: u8 = parts.get(cidx).and_then(|s| s.parse().ok()).unwrap_or(255);
+                        let g: u8 = parts.get(cidx + 1).and_then(|s| s.parse().ok()).unwrap_or(255);
+                        let b: u8 = parts.get(cidx + 2).and_then(|s| s.parse().ok()).unwrap_or(255);
+                        Some(Color { r, g, b })
+                    } else { None };
+
+                    vertices.push(Vertex {
+                        position: nalgebra::Point3::new(x, y, z),
+                        normal,
+                        tex_coord: None,
+                        color,
+                    });
+                }
+
+                for _ in 0..face_count {
+                    let mut line = String::new();
+                    reader.read_line(&mut line)?;
+                    let parts: Vec<&str> = line.trim().split_whitespace().collect();
+                    if parts.len() < 4 { continue; }
+                    let count: usize = parts[0].parse().unwrap_or(0);
+                    if count == 3 {
+                        let i0: usize = parts[1].parse().unwrap_or(0);
+                        let i1: usize = parts[2].parse().unwrap_or(0);
+                        let i2: usize = parts[3].parse().unwrap_or(0);
+                        faces.push(TriangleFace { indices: [i0, i1, i2] });
+                    }
+                }
+            }
+            "binary_little_endian" | "binary_big_endian" => {
+                use byteorder::{LittleEndian, BigEndian, ReadBytesExt};
+                let is_little = format_str == "binary_little_endian";
+
+                for _ in 0..vertex_count {
+                    let x = if is_little { reader.read_f64::<LittleEndian>()? } else { reader.read_f64::<BigEndian>()? };
+                    let y = if is_little { reader.read_f64::<LittleEndian>()? } else { reader.read_f64::<BigEndian>()? };
+                    let z = if is_little { reader.read_f64::<LittleEndian>()? } else { reader.read_f64::<BigEndian>()? };
+
+                    let normal = if has_nx && has_ny && has_nz {
+                        let nx = if is_little { reader.read_f64::<LittleEndian>()? } else { reader.read_f64::<BigEndian>()? };
+                        let ny = if is_little { reader.read_f64::<LittleEndian>()? } else { reader.read_f64::<BigEndian>()? };
+                        let nz = if is_little { reader.read_f64::<LittleEndian>()? } else { reader.read_f64::<BigEndian>()? };
+                        Some(nalgebra::Vector3::new(nx, ny, nz))
+                    } else { None };
+
+                    let color = if has_red && has_green && has_blue {
+                        let r = reader.read_u8()?;
+                        let g = reader.read_u8()?;
+                        let b = reader.read_u8()?;
+                        Some(Color { r, g, b })
+                    } else { None };
+
+                    vertices.push(Vertex {
+                        position: nalgebra::Point3::new(x, y, z),
+                        normal,
+                        tex_coord: None,
+                        color,
+                    });
+                }
+
+                for _ in 0..face_count {
+                    let count = reader.read_u8()? as usize;
+                    if count == 3 {
+                        let i0 = if is_little { reader.read_i32::<LittleEndian>()? } else { reader.read_i32::<BigEndian>()? } as usize;
+                        let i1 = if is_little { reader.read_i32::<LittleEndian>()? } else { reader.read_i32::<BigEndian>()? } as usize;
+                        let i2 = if is_little { reader.read_i32::<LittleEndian>()? } else { reader.read_i32::<BigEndian>()? } as usize;
+                        faces.push(TriangleFace { indices: [i0, i1, i2] });
+                    } else {
+                        for _ in 0..count {
+                            if is_little { reader.read_i32::<LittleEndian>()?; } else { reader.read_i32::<BigEndian>()?; }
+                        }
+                    }
+                }
+            }
+            _ => return Err(PointCloudError::ParseError(format!("不支持的PLY格式: {}", format_str))),
+        }
+
+        Ok(Mesh { vertices, faces })
+    }
+
+    pub fn read_obj(&self, path: &Path) -> Result<Mesh> {
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        let lines = std::io::BufRead::lines(reader);
+
+        let mut vertices: Vec<Vertex> = Vec::new();
+        let mut normals: Vec<nalgebra::Vector3<f64>> = Vec::new();
+        let mut faces: Vec<TriangleFace> = Vec::new();
+        let mut face_normals: Vec<[usize; 3]> = Vec::new();
+
+        for line_result in lines {
+            let line = line_result?;
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.is_empty() { continue; }
+
+            match parts[0] {
+                "v" => {
+                    if parts.len() >= 4 {
+                        let x: f64 = parts[1].parse().unwrap_or(0.0);
+                        let y: f64 = parts[2].parse().unwrap_or(0.0);
+                        let z: f64 = parts[3].parse().unwrap_or(0.0);
+                        let color = if parts.len() >= 7 {
+                            let r = (parts[4].parse::<f64>().unwrap_or(1.0) * 255.0) as u8;
+                            let g = (parts[5].parse::<f64>().unwrap_or(1.0) * 255.0) as u8;
+                            let b = (parts[6].parse::<f64>().unwrap_or(1.0) * 255.0) as u8;
+                            Some(Color { r, g, b })
+                        } else { None };
+                        vertices.push(Vertex {
+                            position: nalgebra::Point3::new(x, y, z),
+                            normal: None,
+                            tex_coord: None,
+                            color,
+                        });
+                    }
+                }
+                "vn" => {
+                    if parts.len() >= 4 {
+                        let nx: f64 = parts[1].parse().unwrap_or(0.0);
+                        let ny: f64 = parts[2].parse().unwrap_or(0.0);
+                        let nz: f64 = parts[3].parse().unwrap_or(0.0);
+                        normals.push(nalgebra::Vector3::new(nx, ny, nz));
+                    }
+                }
+                "f" => {
+                    let mut vert_indices = Vec::new();
+                    let mut norm_indices = Vec::new();
+                    for part in &parts[1..] {
+                        let indices: Vec<&str> = part.split('/').collect();
+                        if let Some(v_idx) = indices.first() {
+                            if let Ok(idx) = v_idx.parse::<i32>() {
+                                let idx_i32 = if idx > 0 { idx - 1 } else { vertices.len() as i32 + idx };
+                                vert_indices.push(idx_i32 as usize);
+                            }
+                        }
+                        if indices.len() >= 3 {
+                            if let Ok(n_idx) = indices[2].parse::<i32>() {
+                                let nidx_i32 = if n_idx > 0 { n_idx - 1 } else { normals.len() as i32 + n_idx };
+                                norm_indices.push(nidx_i32 as usize);
+                            }
+                        }
+                    }
+                    if vert_indices.len() >= 3 {
+                        faces.push(TriangleFace { indices: [vert_indices[0], vert_indices[1], vert_indices[2]] });
+                        if norm_indices.len() >= 3 {
+                            face_normals.push([norm_indices[0], norm_indices[1], norm_indices[2]]);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !normals.is_empty() && !face_normals.is_empty() {
+            let mut vertex_normal_indices: Vec<Option<usize>> = vec![None; vertices.len()];
+            for (i, face) in faces.iter().enumerate() {
+                if i < face_normals.len() {
+                    for j in 0..3 {
+                        let vi = face.indices[j];
+                        let ni = face_normals[i][j];
+                        if vertex_normal_indices[vi].is_none() {
+                            vertex_normal_indices[vi] = Some(ni);
+                        }
+                    }
+                }
+            }
+            for (i, v) in vertices.iter_mut().enumerate() {
+                if let Some(ni) = vertex_normal_indices[i] {
+                    if ni < normals.len() {
+                        v.normal = Some(normals[ni]);
+                    }
+                }
+            }
+        }
+
+        Ok(Mesh { vertices, faces })
+    }
+
+    pub fn read_stl(&self, path: &Path) -> Result<Mesh> {
+        let file = File::open(path)?;
+        let mut reader = BufReader::new(file);
+
+        let mut header_bytes = [0u8; 80];
+        if reader.read(&mut header_bytes)? < 80 {
+            return Err(PointCloudError::ParseError("STL文件太短".into()));
+        }
+
+        let header_str = String::from_utf8_lossy(&header_bytes);
+        let is_ascii = header_str.starts_with("solid");
+
+        if is_ascii {
+            self.read_stl_ascii(path)
+        } else {
+            self.read_stl_binary(&mut reader)
+        }
+    }
+
+    fn read_stl_ascii(&self, path: &Path) -> Result<Mesh> {
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        let lines = std::io::BufRead::lines(reader);
+
+        let mut vertices: Vec<Vertex> = Vec::new();
+        let mut faces: Vec<TriangleFace> = Vec::new();
+        let mut current_normal: Option<nalgebra::Vector3<f64>> = None;
+        let mut face_vertices: Vec<usize> = Vec::new();
+
+        for line_result in lines {
+            let line = line_result?.trim().to_lowercase();
+            if line.is_empty() { continue; }
+
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.is_empty() { continue; }
+
+            match parts[0] {
+                "facet" => {
+                    if parts.len() >= 5 && parts[1] == "normal" {
+                        let nx: f64 = parts[2].parse().unwrap_or(0.0);
+                        let ny: f64 = parts[3].parse().unwrap_or(0.0);
+                        let nz: f64 = parts[4].parse().unwrap_or(0.0);
+                        current_normal = Some(nalgebra::Vector3::new(nx, ny, nz));
+                    }
+                    face_vertices.clear();
+                }
+                "vertex" => {
+                    if parts.len() >= 4 {
+                        let x: f64 = parts[1].parse().unwrap_or(0.0);
+                        let y: f64 = parts[2].parse().unwrap_or(0.0);
+                        let z: f64 = parts[3].parse().unwrap_or(0.0);
+                        let v = Vertex {
+                            position: nalgebra::Point3::new(x, y, z),
+                            normal: current_normal,
+                            tex_coord: None,
+                            color: None,
+                        };
+                        vertices.push(v);
+                        face_vertices.push(vertices.len() - 1);
+                    }
+                }
+                "endfacet" => {
+                    if face_vertices.len() >= 3 {
+                        faces.push(TriangleFace { indices: [face_vertices[0], face_vertices[1], face_vertices[2]] });
+                    }
+                    current_normal = None;
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Mesh { vertices, faces })
+    }
+
+    fn read_stl_binary<R: std::io::Read>(&self, reader: &mut R) -> Result<Mesh> {
+        use byteorder::{LittleEndian, ReadBytesExt};
+
+        let num_triangles = reader.read_u32::<LittleEndian>()? as usize;
+        let mut vertices: Vec<Vertex> = Vec::with_capacity(num_triangles * 3);
+        let mut faces: Vec<TriangleFace> = Vec::with_capacity(num_triangles);
+
+        for _ in 0..num_triangles {
+            let nx = reader.read_f32::<LittleEndian>()? as f64;
+            let ny = reader.read_f32::<LittleEndian>()? as f64;
+            let nz = reader.read_f32::<LittleEndian>()? as f64;
+            let normal = nalgebra::Vector3::new(nx, ny, nz);
+
+            let mut idx = [0usize; 3];
+            for j in 0..3 {
+                let x = reader.read_f32::<LittleEndian>()? as f64;
+                let y = reader.read_f32::<LittleEndian>()? as f64;
+                let z = reader.read_f32::<LittleEndian>()? as f64;
+                vertices.push(Vertex {
+                    position: nalgebra::Point3::new(x, y, z),
+                    normal: Some(normal),
+                    tex_coord: None,
+                    color: None,
+                });
+                idx[j] = vertices.len() - 1;
+            }
+            faces.push(TriangleFace { indices: idx });
+
+            let _attr = reader.read_u16::<LittleEndian>()?;
+        }
+
+        Ok(Mesh { vertices, faces })
+    }
+}

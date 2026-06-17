@@ -54,8 +54,8 @@ enum Commands {
         #[arg(short = 'n', long, help = "法向量估计K近邻数 (启用法向量估计)")]
         normals: Option<usize>,
 
-        #[arg(short = 'r', long, value_enum, help = "表面重建算法", default_value_t = ReconAlgo::Poisson)]
-        reconstruct: ReconAlgo,
+        #[arg(short = 'r', long, value_enum, help = "表面重建算法 (不指定则只做格式转换)")]
+        reconstruct: Option<ReconAlgo>,
 
         #[arg(long, help = "Poisson重建深度 (默认8)")]
         poisson_depth: Option<u32>,
@@ -222,7 +222,7 @@ fn do_convert(
     do_filter: bool,
     downsample: Option<f64>,
     normals_k: Option<usize>,
-    recon: ReconAlgo,
+    recon: Option<ReconAlgo>,
     poisson_depth: Option<u32>,
     mc_resolution: Option<u32>,
 ) -> Result<()> {
@@ -231,7 +231,7 @@ fn do_convert(
     use normals::*;
 
     let reader = io::PointCloudReader::new();
-    let writer = io::MeshWriter::new();
+    let mesh_writer = io::MeshWriter::new();
 
     let total_start = std::time::Instant::now();
     log::info!("读取: {}", input.display());
@@ -255,8 +255,12 @@ fn do_convert(
         pc = result.downsampled;
     }
 
-    let need_normals = matches!(recon, ReconAlgo::Poisson | ReconAlgo::BallPivoting)
-        || normals_k.is_some();
+    let need_reconstruct = recon.is_some();
+    let need_normals = if let Some(r) = &recon {
+        matches!(r, ReconAlgo::Poisson | ReconAlgo::BallPivoting) || normals_k.is_some()
+    } else {
+        normals_k.is_some()
+    };
 
     if need_normals && !pc.has_normals() {
         let k = normals_k.unwrap_or(20);
@@ -266,33 +270,62 @@ fn do_convert(
         pc = result.point_cloud;
     }
 
-    log::info!("表面重建 ({:?})...", recon);
-    let algorithm = match recon {
-        ReconAlgo::Poisson => ReconstructionAlgorithm::Poisson,
-        ReconAlgo::BallPivoting => ReconstructionAlgorithm::BallPivoting,
-        ReconAlgo::MarchingCubes => ReconstructionAlgorithm::MarchingCubes,
-    };
-    let pp = PoissonParams { depth: poisson_depth.unwrap_or(8), ..Default::default() };
-    let bp = BallPivotingParams::default();
-    let mcp = MarchingCubesParams { resolution: mc_resolution.unwrap_or(64), ..Default::default() };
+    if need_reconstruct {
+        let recon = recon.unwrap();
+        log::info!("表面重建 ({:?})...", recon);
+        let algorithm = match recon {
+            ReconAlgo::Poisson => ReconstructionAlgorithm::Poisson,
+            ReconAlgo::BallPivoting => ReconstructionAlgorithm::BallPivoting,
+            ReconAlgo::MarchingCubes => ReconstructionAlgorithm::MarchingCubes,
+        };
+        let pp = PoissonParams { depth: poisson_depth.unwrap_or(8), ..Default::default() };
+        let bp = BallPivotingParams::default();
+        let mcp = MarchingCubesParams { resolution: mc_resolution.unwrap_or(64), ..Default::default() };
 
-    let mesh = reconstruct_surface(&pc, algorithm, &pp, &bp, &mcp)?;
-    log::info!("  生成: {} 顶点, {} 面片", mesh.vertex_count(), mesh.face_count());
+        let mesh = reconstruct_surface(&pc, algorithm, &pp, &bp, &mcp)?;
+        log::info!("  生成: {} 顶点, {} 面片", mesh.vertex_count(), mesh.face_count());
 
-    if let Some(parent) = output.parent() {
-        std::fs::create_dir_all(parent).ok();
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+
+        mesh_writer.write(&mesh, output)?;
+        log::info!("已写入网格: {}", output.display());
+
+        let elapsed = total_start.elapsed();
+        println!("\n处理完成!");
+        println!("  初始点数:   {}", initial);
+        println!("  处理后:     {} 点 -> {} 顶点, {} 面片",
+            pc.len(), mesh.vertex_count(), mesh.face_count()
+        );
+        println!("  总耗时:     {:.2}s", elapsed.as_secs_f64());
+    } else {
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+
+        let output_ext = output.extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        match output_ext.as_str() {
+            "ply" => {
+                io::write_point_cloud_ply(&pc, output)?;
+                log::info!("已写入点云: {}", output.display());
+            }
+            _ => {
+                return Err(crate::error::PointCloudError::ConfigError(
+                    format!("不支持的点云输出格式: .{} (不做重建时仅支持 .ply 点云输出)", output_ext)
+                ));
+            }
+        }
+
+        let elapsed = total_start.elapsed();
+        println!("\n格式转换完成!");
+        println!("  点数:       {}", pc.len());
+        println!("  总耗时:     {:.2}s", elapsed.as_secs_f64());
     }
-
-    writer.write(&mesh, output)?;
-    log::info!("已写入: {}", output.display());
-
-    let elapsed = total_start.elapsed();
-    println!("\n处理完成!");
-    println!("  初始点数:   {}", initial);
-    println!("  处理后:     {} 点 -> {} 顶点, {} 面片",
-        pc.len(), mesh.vertex_count(), mesh.face_count()
-    );
-    println!("  总耗时:     {:.2}s", elapsed.as_secs_f64());
 
     Ok(())
 }
@@ -362,22 +395,44 @@ fn do_measurement(action: MeasureActions) -> Result<()> {
         }
 
         MeasureActions::Volume { input } => {
-            let format = crate::utils::detect_mesh_format(&input);
-            match format {
-                Ok(_) => {
-                    log::warn!("暂不支持从文件读取网格，尝试作为点云读取估计体积");
+            let mesh_reader = io::MeshReader::new();
+            let pc_reader = io::PointCloudReader::new();
+
+            let is_mesh = matches!(crate::utils::detect_mesh_format(&input), Ok(_))
+                && input.extension().and_then(|e| e.to_str())
+                    .map(|e| e.to_lowercase() == "obj" || e.to_lowercase() == "stl")
+                    .unwrap_or(false);
+
+            if is_mesh {
+                let mesh = mesh_reader.read(&input)?;
+                let result = measurement::estimate_mesh_volume(&mesh)?;
+                println!("体积计算 (网格):");
+                println!("  顶点数: {}", mesh.vertex_count());
+                println!("  面片数: {}", mesh.face_count());
+                println!("  体积: {:.6} 立方米", result.volume);
+                println!("  注: 基于散度定理，适用于封闭流形网格");
+            } else {
+                match mesh_reader.read(&input) {
+                    Ok(mesh) if mesh.face_count() > 0 => {
+                        let result = measurement::estimate_mesh_volume(&mesh)?;
+                        println!("体积计算 (网格):");
+                        println!("  顶点数: {}", mesh.vertex_count());
+                        println!("  面片数: {}", mesh.face_count());
+                        println!("  体积: {:.6} 立方米", result.volume);
+                        println!("  注: 基于散度定理，适用于封闭流形网格");
+                    }
+                    _ => {
+                        let pc = pc_reader.read(&input)?;
+                        let density = measurement::estimate_point_density(&pc, 10)?;
+                        let vol = measurement::point_cloud_volume_convex_hull(&pc)?;
+                        println!("体积估算 (点云，近似值):");
+                        println!("  点云总点数: {}", pc.len());
+                        println!("  平均密度: {:.2} 点/立方米", density.average_density);
+                        println!("  近似体积 (AABB): {:.6} 立方米", vol);
+                        println!("  注: 此为AABB体积近似，封闭网格体积更准确");
+                    }
                 }
-                Err(_) => {}
             }
-            let reader = io::PointCloudReader::new();
-            let pc = reader.read(&input)?;
-            let density = estimate_point_density(&pc, 10)?;
-            let vol = point_cloud_volume_convex_hull(&pc)?;
-            println!("体积估算 (基于AABB，近似值):");
-            println!("  点云总点数: {}", pc.len());
-            println!("  平均密度: {:.2} 点/立方米", density.average_density);
-            println!("  近似体积 (AABB): {:.6} 立方米", vol);
-            println!("  注: 此为AABB体积近似，对封闭网格使用Convert生成后计算更准确");
         }
 
         MeasureActions::Section { input, normal, point, thickness } => {

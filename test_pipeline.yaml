@@ -1,0 +1,29 @@
+input:
+  - test_cloud.xyz
+
+pipeline:
+  - step: Filter
+    params:
+      type: statistical
+      k: 20
+      std_ratio: 1.5
+
+  - step: Downsample
+    params:
+      type: voxel
+      size: 0.1
+
+  - step: Normals
+    params:
+      k: 15
+
+  - step: Reconstruct
+    params:
+      type: poisson
+      depth: 6
+
+output: result.obj
+
+output_intermediate: true
+output_dir: ./output
+report_path: report.json

@@ -29,6 +29,7 @@ num-traits = "0.2"
 uuid = { version = "1.0", features = ["serde"] }
 crossbeam = "0.8"
 smallvec = "1.13"
+chrono = { version = "0.4", features = ["serde"] }
 
 [profile.release]
 opt-level = 3

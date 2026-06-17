@@ -142,11 +142,8 @@ impl Default for PipelineReport {
 }
 
 fn chrono_like_now() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    let secs = dur.as_secs();
-    let years = 1970 + secs / 31536000;
-    format!("{}-01-01T00:00:00Z", years)
+    use chrono::Utc;
+    Utc::now().to_rfc3339()
 }
 
 impl PipelineReport {

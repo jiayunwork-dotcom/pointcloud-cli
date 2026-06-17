@@ -18,7 +18,7 @@ pub struct PipelineConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "step", content = "params")]
+#[serde(tag = "step", content = "params", rename_all = "snake_case")]
 pub enum PipelineStep {
     Filter {
         #[serde(rename = "type", default = "default_filter_type")]

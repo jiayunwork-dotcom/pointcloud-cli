@@ -1,0 +1,83 @@
+{
+  "generated_at": "2026-01-01T00:00:00Z",
+  "total_files": 1,
+  "successful_files": 1,
+  "failed_files": 0,
+  "total_time_ms": 32,
+  "input_files": [
+    "test_cloud.xyz"
+  ],
+  "output_files": [
+    "./output/test_cloud_result.obj"
+  ],
+  "per_file": {
+    "test_cloud.xyz": {
+      "file_path": "test_cloud.xyz",
+      "success": true,
+      "error_message": null,
+      "total_time_ms": 31,
+      "point_cloud_stats": {
+        "initial_points": 520,
+        "points_after_filter": 502,
+        "points_after_downsample": 487,
+        "points_after_ground_removal": null,
+        "has_normals": true,
+        "point_density": 3.2498053598170027,
+        "bounding_box_min": [
+          -2.596599821627347,
+          -2.6103655301035733,
+          -2.842295839150406
+        ],
+        "bounding_box_max": [
+          2.563946740339066,
+          2.7167363776776465,
+          2.978190672928564
+        ],
+        "centroid": [
+          0.019336597273948417,
+          0.011166975561653886,
+          0.0026110805386353533
+        ]
+      },
+      "filter_stats": [
+        {
+          "filter_type": "statistical",
+          "removed_count": 18,
+          "removed_ratio": 0.03461538461538462,
+          "time_ms": 0
+        }
+      ],
+      "downsample_stats": {
+        "downsample_type": "voxel",
+        "original_count": 502,
+        "final_count": 487,
+        "compression_ratio": 0.9701195219123506,
+        "time_ms": 0
+      },
+      "ground_removal_stats": null,
+      "normal_stats": {
+        "k": 15,
+        "mean_curvature": 0.08184465417682321,
+        "time_ms": 1
+      },
+      "registration_stats": null,
+      "reconstruction_stats": {
+        "reconstruct_type": "poisson",
+        "vertices": 50373,
+        "faces": 16791,
+        "time_ms": 8
+      },
+      "mesh_stats": null,
+      "segmentation_stats": null
+    }
+  },
+  "summary": {
+    "total_initial_points": 520,
+    "total_final_points": 487,
+    "total_mesh_vertices": 50373,
+    "total_mesh_faces": 16791,
+    "total_planes_detected": 0,
+    "total_clusters_found": 0,
+    "average_processing_time_ms": 32.0
+  }
+}
