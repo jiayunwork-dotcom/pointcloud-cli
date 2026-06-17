@@ -116,6 +116,20 @@ pub enum PipelineStep {
         #[serde(default)]
         min_cluster_size: Option<usize>,
     },
+    Quality {
+        #[serde(default)]
+        threshold: Option<f64>,
+        #[serde(default)]
+        weights: Option<Vec<f64>>,
+        #[serde(default)]
+        assess_completeness: Option<bool>,
+        #[serde(default)]
+        auto_fix: Option<bool>,
+        #[serde(default)]
+        octree_depth: Option<usize>,
+        #[serde(default)]
+        noise_k: Option<usize>,
+    },
 }
 
 fn default_filter_type() -> String { "statistical".to_string() }
@@ -185,6 +199,12 @@ pipeline:
       type: laplacian
       iterations: 20
       lambda: 0.5
+
+  - step: quality
+    params:
+      threshold: 60
+      assess_completeness: false
+      auto_fix: false
 
 output: result.obj
 

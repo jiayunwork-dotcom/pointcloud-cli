@@ -106,6 +106,32 @@ enum Commands {
         #[arg(help = "输入点云文件")]
         input: PathBuf,
     },
+
+    Quality {
+        #[arg(help = "输入点云文件")]
+        input: PathBuf,
+
+        #[arg(long, help = "以JSON格式输出评估报告")]
+        json: bool,
+
+        #[arg(long, help = "执行自动修复")]
+        fix: bool,
+
+        #[arg(long, help = "修复后点云输出路径")]
+        fix_output: Option<PathBuf>,
+
+        #[arg(long, help = "五项权重,逗号分隔(密度,法向量,重叠,噪声,完整性),自动归一化")]
+        weights: Option<String>,
+
+        #[arg(long, help = "启用完整性评估(封闭曲面)")]
+        assess_completeness: bool,
+
+        #[arg(long, help = "八叉树最大深度 (默认: 6)")]
+        octree_depth: Option<usize>,
+
+        #[arg(long, help = "噪声评估K近邻数 (默认: 15)")]
+        noise_k: Option<usize>,
+    },
 }
 
 #[derive(ValueEnum, Clone, Debug)]
@@ -175,6 +201,8 @@ fn main() {
         Commands::Measure { action } => do_measurement(action),
         Commands::ExampleConfig { output } => write_example_config(output),
         Commands::Benchmark { input } => run_benchmark(&input),
+        Commands::Quality { input, json, fix, fix_output, weights, assess_completeness, octree_depth, noise_k }
+            => run_quality(&input, json, fix, fix_output, weights, assess_completeness, octree_depth, noise_k),
     };
 
     if let Err(e) = result {
@@ -845,5 +873,103 @@ fn run_benchmark(input: &Path) -> Result<()> {
     }
 
     println!("{:=<70}", "");
+    Ok(())
+}
+
+fn run_quality(
+    input: &Path,
+    as_json: bool,
+    do_fix: bool,
+    fix_output: Option<PathBuf>,
+    weights_str: Option<String>,
+    assess_completeness_flag: bool,
+    octree_depth: Option<usize>,
+    noise_k: Option<usize>,
+) -> Result<()> {
+    use quality::{
+        QualityWeights, QualityAssessmentParams, RepairParams,
+        assess_quality, auto_repair, print_quality_report, quality_report_to_json,
+    };
+
+    log::info!("读取点云: {}", input.display());
+    let reader = io::PointCloudReader::new();
+    let pc = reader.read(input)?;
+    log::info!("  共 {} 点", pc.len());
+
+    let weights = if let Some(ws) = weights_str {
+        let parts: Vec<&str> = ws.split(',').collect();
+        if parts.len() != 5 {
+            return Err(PointCloudError::InvalidParameter(
+                "权重需要恰好5个值,用逗号分隔".to_string()
+            ));
+        }
+        let parsed: std::result::Result<Vec<f64>, _> = parts.iter().map(|s| s.parse::<f64>()).collect();
+        match parsed {
+            Ok(w) => QualityWeights::from_slice(&w)?,
+            Err(_) => {
+                return Err(PointCloudError::InvalidParameter(
+                    "权重值解析失败".to_string()
+                ));
+            }
+        }
+    } else {
+        QualityWeights::default()
+    };
+
+    let mut params = QualityAssessmentParams::default();
+    params.assess_completeness = assess_completeness_flag;
+    if let Some(d) = octree_depth {
+        params.octree_max_depth = d;
+    }
+    if let Some(k) = noise_k {
+        params.noise_k = k;
+    }
+
+    log::info!("执行质量评估...");
+    let report = assess_quality(&pc, &params, &weights)?;
+
+    if as_json {
+        let json = quality_report_to_json(&report)?;
+        println!("{}", json);
+    } else {
+        print_quality_report(&report);
+    }
+
+    if do_fix {
+        log::info!("执行自动修复...");
+        let repair_params = RepairParams::default();
+        let repair_result = auto_repair(&pc, &report, &repair_params)?;
+
+        println!();
+        println!("{}", "\x1b[1m修复统计:\x1b[0m");
+        println!("  添加点数:   {}", repair_result.points_added);
+        println!("  去除点数:   {}", repair_result.points_removed);
+        println!("  修复法向量: {}", repair_result.normals_fixed);
+        println!("  滤波迭代:   {}", repair_result.iterations);
+
+        let output_path = fix_output.unwrap_or_else(|| {
+            let stem = input.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("output");
+            input.with_file_name(format!("{}_fixed.ply", stem))
+        });
+
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+
+        io::write_point_cloud_ply(&repair_result.point_cloud, &output_path)?;
+        println!();
+        println!("修复后点云已保存到: {}", output_path.display());
+
+        if !as_json {
+            log::info!("重新评估修复后点云质量...");
+            let report_after = assess_quality(&repair_result.point_cloud, &params, &weights)?;
+            println!();
+            println!("{}", "\x1b[1m修复后质量:\x1b[0m");
+            print_quality_report(&report_after);
+        }
+    }
+
     Ok(())
 }

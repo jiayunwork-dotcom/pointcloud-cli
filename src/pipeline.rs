@@ -8,6 +8,7 @@ use crate::registration::*;
 use crate::reconstruction::*;
 use crate::mesh_processing::*;
 use crate::segmentation::*;
+use crate::quality::*;
 use crate::report::*;
 
 use std::path::{Path, PathBuf};
@@ -243,6 +244,7 @@ impl PipelineEngine {
                         reconstruction_stats: None,
                         mesh_stats: None,
                         segmentation_stats: None,
+                        quality_stats: None,
                     };
                     report.per_file.insert(file_key, file_report);
                     log::error!("处理文件失败: {}", e);
@@ -319,6 +321,7 @@ impl PipelineEngine {
             reconstruction_stats: None,
             mesh_stats: None,
             segmentation_stats: None,
+            quality_stats: None,
         };
 
         let stem = input_path.file_stem()
@@ -694,6 +697,90 @@ impl PipelineEngine {
                         }
                     }
                 }
+
+                PipelineStep::Quality { threshold, weights, assess_completeness, auto_fix, octree_depth, noise_k } => {
+                    let step_start = Instant::now();
+                    let threshold_val = threshold.unwrap_or(60.0);
+
+                    let quality_weights = if let Some(ref w) = weights {
+                        QualityWeights::from_slice(w)?
+                    } else {
+                        QualityWeights::default()
+                    };
+
+                    let mut quality_params = QualityAssessmentParams::default();
+                    quality_params.assess_completeness = assess_completeness.unwrap_or(false);
+                    if let Some(d) = octree_depth {
+                        quality_params.octree_max_depth = *d;
+                    }
+                    if let Some(k) = noise_k {
+                        quality_params.noise_k = *k;
+                    }
+
+                    log::info!("  质量评估中...");
+                    let quality_report = assess_quality(&point_cloud, &quality_params, &quality_weights)?;
+                    let passed = quality_report.overall_score >= threshold_val;
+
+                    log::info!("  综合得分: {:.1}, 阈值: {:.1}, {}",
+                        quality_report.overall_score,
+                        threshold_val,
+                        if passed { "通过" } else { "未通过" }
+                    );
+
+                    let do_auto_fix = auto_fix.unwrap_or(false);
+                    let mut points_added = None;
+                    let mut points_removed = None;
+                    let mut normals_fixed = None;
+
+                    if do_auto_fix && !passed {
+                        log::info!("  执行自动修复...");
+                        let repair_params = RepairParams::default();
+                        let repair_result = auto_repair(&point_cloud, &quality_report, &repair_params)?;
+                        points_added = Some(repair_result.points_added);
+                        points_removed = Some(repair_result.points_removed);
+                        normals_fixed = Some(repair_result.normals_fixed);
+                        point_cloud = repair_result.point_cloud;
+                        log::info!("  修复完成: +{} 点, -{} 点, 修复 {} 法向量",
+                            repair_result.points_added,
+                            repair_result.points_removed,
+                            repair_result.normals_fixed
+                        );
+                    }
+
+                    file_report.quality_stats = Some(QualityStats {
+                        overall_score: quality_report.overall_score,
+                        density_score: quality_report.density.score,
+                        density_cv: quality_report.density.cv,
+                        normal_score: quality_report.normal.score,
+                        normal_flip_rate: quality_report.normal.flip_rate,
+                        overlap_score: quality_report.overlap.score,
+                        overlap_rate: quality_report.overlap.overlap_rate,
+                        noise_score: quality_report.noise.score,
+                        noise_normalized: quality_report.noise.normalized_noise,
+                        completeness_score: quality_report.completeness.score,
+                        large_holes: quality_report.completeness.large_holes,
+                        assessed_completeness: quality_report.completeness.assessed,
+                        threshold: threshold_val,
+                        passed,
+                        auto_fix: do_auto_fix,
+                        points_added,
+                        points_removed,
+                        normals_fixed,
+                        time_ms: duration_to_ms(step_start.elapsed()),
+                    });
+
+                    if !passed && !do_auto_fix {
+                        return Err(PointCloudError::ConfigError(format!(
+                            "质量评估未通过: 综合得分 {:.1} < 阈值 {:.1}",
+                            quality_report.overall_score, threshold_val
+                        )));
+                    }
+
+                    if output_intermediate {
+                        let out = output_dir.join(format!("{}_step{}_quality.ply", stem, step_idx));
+                        write_point_cloud_ply(&point_cloud, &out).ok();
+                    }
+                }
             }
         }
 
@@ -758,6 +845,7 @@ fn step_name(step: &PipelineStep) -> String {
         PipelineStep::Simplify { .. } => "Simplify".to_string(),
         PipelineStep::Smooth { .. } => "Smooth".to_string(),
         PipelineStep::Segment { .. } => "Segment".to_string(),
+        PipelineStep::Quality { .. } => "Quality".to_string(),
     }
 }
 
@@ -890,6 +978,16 @@ fn describe_step(step: &PipelineStep) -> String {
                     ));
                 }
             }
+            desc
+        }
+        PipelineStep::Quality { threshold, weights, assess_completeness, auto_fix, octree_depth, noise_k } => {
+            let mut desc = format!("Quality (阈值={}", threshold.unwrap_or(60.0));
+            if weights.is_some() { desc.push_str(", 自定义权重"); }
+            if assess_completeness.unwrap_or(false) { desc.push_str(", 完整性评估"); }
+            if auto_fix.unwrap_or(false) { desc.push_str(", 自动修复"); }
+            if octree_depth.is_some() { desc.push_str(&format!(", octree_depth={}", octree_depth.unwrap())); }
+            if noise_k.is_some() { desc.push_str(&format!(", noise_k={}", noise_k.unwrap())); }
+            desc.push_str(")");
             desc
         }
     }

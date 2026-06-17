@@ -86,6 +86,29 @@ pub struct SegmentationStats {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualityStats {
+    pub overall_score: f64,
+    pub density_score: f64,
+    pub density_cv: f64,
+    pub normal_score: f64,
+    pub normal_flip_rate: f64,
+    pub overlap_score: f64,
+    pub overlap_rate: f64,
+    pub noise_score: f64,
+    pub noise_normalized: f64,
+    pub completeness_score: f64,
+    pub large_holes: usize,
+    pub assessed_completeness: bool,
+    pub threshold: f64,
+    pub passed: bool,
+    pub auto_fix: bool,
+    pub points_added: Option<usize>,
+    pub points_removed: Option<usize>,
+    pub normals_fixed: Option<usize>,
+    pub time_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileProcessingReport {
     pub file_path: String,
     pub success: bool,
@@ -100,6 +123,7 @@ pub struct FileProcessingReport {
     pub reconstruction_stats: Option<ReconstructionStats>,
     pub mesh_stats: Option<MeshProcessingStats>,
     pub segmentation_stats: Option<SegmentationStats>,
+    pub quality_stats: Option<QualityStats>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +212,13 @@ impl PipelineReport {
             }
             if let Some(ref rs) = report.reconstruction_stats {
                 println!("  重建: {} 顶点, {} 面片", rs.vertices, rs.faces);
+            }
+            if let Some(ref qs) = report.quality_stats {
+                let q_color = if qs.overall_score >= 70.0 { "\x1b[32m" } else if qs.overall_score >= 40.0 { "\x1b[33m" } else { "\x1b[31m" };
+                println!("  质量: {}{:.1}{}/100 ({})",
+                    q_color, qs.overall_score, "\x1b[0m",
+                    if qs.passed { "通过" } else { "未通过" }
+                );
             }
             if let Some(ref e) = report.error_message {
                 println!("  错误: {}", e);
