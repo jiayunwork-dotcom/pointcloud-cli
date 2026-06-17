@@ -1,0 +1,674 @@
+use crate::error::{Result, PointCloudError};
+use crate::types::{PointCloud, Mesh};
+use crate::config::{PipelineConfig, PipelineStep};
+use crate::io::{PointCloudReader, MeshWriter, find_point_cloud_files, write_point_cloud_ply};
+use crate::preprocess::*;
+use crate::normals::*;
+use crate::registration::*;
+use crate::reconstruction::*;
+use crate::mesh_processing::*;
+use crate::segmentation::*;
+use crate::report::*;
+
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+use indicatif::{ProgressBar, ProgressStyle};
+use nalgebra::Matrix4;
+
+pub struct PipelineEngine {
+    reader: PointCloudReader,
+    writer: MeshWriter,
+}
+
+impl Default for PipelineEngine {
+    fn default() -> Self {
+        PipelineEngine {
+            reader: PointCloudReader::new(),
+            writer: MeshWriter::new(),
+        }
+    }
+}
+
+impl PipelineEngine {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn run_from_config(&self, config: &PipelineConfig) -> Result<PipelineReport> {
+        let start_total = Instant::now();
+
+        let input_files = self.collect_input_files(config)?;
+        if input_files.is_empty() {
+            return Err(PointCloudError::ConfigError(
+                "未找到任何输入点云文件".to_string()
+            ));
+        }
+
+        log::info!("找到 {} 个输入文件", input_files.len());
+
+        let output_dir = config.output_dir.as_ref()
+            .map(|s| PathBuf::from(s))
+            .unwrap_or_else(|| PathBuf::from("./output"));
+
+        if config.output_intermediate || config.output_dir.is_some() {
+            std::fs::create_dir_all(&output_dir).ok();
+        }
+
+        let mut report = PipelineReport::default();
+        report.total_files = input_files.len();
+        report.input_files = input_files.iter().map(|p| p.to_string_lossy().to_string()).collect();
+
+        let pb = ProgressBar::new(input_files.len() as u64);
+        pb.set_style(ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}"
+        ).unwrap_or_else(|_| ProgressStyle::default_bar()));
+
+        for (idx, input_path) in input_files.iter().enumerate() {
+            pb.set_message(format!("处理: {}", input_path.display()));
+            let result = self.process_single_file(
+                input_path, &config.pipeline, &config.output, &output_dir, config.output_intermediate
+            );
+
+            let file_key = input_path.to_string_lossy().to_string();
+            match result {
+                Ok((file_report, output_path)) => {
+                    report.successful_files += 1;
+                    report.output_files.push(output_path.to_string_lossy().to_string());
+                    if let Some(ref s) = file_report.point_cloud_stats {
+                        report.summary.total_initial_points += s.initial_points;
+                        let final_pts = s.points_after_ground_removal
+                            .or(s.points_after_downsample)
+                            .or(s.points_after_filter)
+                            .unwrap_or(s.initial_points);
+                        report.summary.total_final_points += final_pts;
+                    }
+                    if let Some(ref r) = file_report.reconstruction_stats {
+                        report.summary.total_mesh_vertices += r.vertices;
+                        report.summary.total_mesh_faces += r.faces;
+                    }
+                    if let Some(ref seg) = file_report.segmentation_stats {
+                        report.summary.total_planes_detected += seg.planes_detected;
+                        if let Some(c) = seg.clusters {
+                            report.summary.total_clusters_found += c;
+                        }
+                    }
+                    report.total_time_ms += file_report.total_time_ms;
+                    report.per_file.insert(file_key, file_report);
+                }
+                Err(e) => {
+                    report.failed_files += 1;
+                    let file_report = FileProcessingReport {
+                        file_path: file_key.clone(),
+                        success: false,
+                        error_message: Some(format!("{}", e)),
+                        total_time_ms: 0,
+                        point_cloud_stats: None,
+                        filter_stats: None,
+                        downsample_stats: None,
+                        ground_removal_stats: None,
+                        normal_stats: None,
+                        registration_stats: None,
+                        reconstruction_stats: None,
+                        mesh_stats: None,
+                        segmentation_stats: None,
+                    };
+                    report.per_file.insert(file_key, file_report);
+                    log::error!("处理文件失败: {}", e);
+                }
+            }
+            pb.inc(1);
+        }
+        pb.finish_with_message("处理完成");
+
+        report.total_time_ms = duration_to_ms(start_total.elapsed());
+        if report.successful_files > 0 {
+            report.summary.average_processing_time_ms =
+                report.total_time_ms as f64 / report.successful_files as f64;
+        }
+
+        if let Some(report_path) = &config.report_path {
+            let p = PathBuf::from(report_path);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            report.save_to_json(&p)?;
+            log::info!("报告已保存到: {}", p.display());
+        }
+
+        Ok(report)
+    }
+
+    fn collect_input_files(&self, config: &PipelineConfig) -> Result<Vec<PathBuf>> {
+        let mut files = Vec::new();
+
+        for p in &config.input {
+            let path = PathBuf::from(p);
+            if path.exists() {
+                if path.is_file() {
+                    files.push(path);
+                } else if path.is_dir() {
+                    files.extend(find_point_cloud_files(&path)?);
+                }
+            }
+        }
+
+        if let Some(dir) = &config.input_dir {
+            let dir_path = PathBuf::from(dir);
+            if dir_path.is_dir() {
+                files.extend(find_point_cloud_files(&dir_path)?);
+            }
+        }
+
+        files.sort();
+        files.dedup();
+        Ok(files)
+    }
+
+    fn process_single_file(
+        &self,
+        input_path: &Path,
+        steps: &[PipelineStep],
+        output_path_template: &str,
+        output_dir: &Path,
+        output_intermediate: bool,
+    ) -> Result<(FileProcessingReport, PathBuf)> {
+        let start = Instant::now();
+        let mut file_report = FileProcessingReport {
+            file_path: input_path.to_string_lossy().to_string(),
+            success: false,
+            error_message: None,
+            total_time_ms: 0,
+            point_cloud_stats: None,
+            filter_stats: None,
+            downsample_stats: None,
+            ground_removal_stats: None,
+            normal_stats: None,
+            registration_stats: None,
+            reconstruction_stats: None,
+            mesh_stats: None,
+            segmentation_stats: None,
+        };
+
+        let stem = input_path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("output");
+
+        log::info!("读取文件: {}", input_path.display());
+        let read_start = Instant::now();
+        let mut point_cloud = self.reader.read(input_path)?;
+        log::info!("  读取完成: {} 点 ({:.2}s)",
+            point_cloud.len(),
+            read_start.elapsed().as_secs_f64()
+        );
+
+        if let Some(summary) = point_cloud.summary() {
+            file_report.point_cloud_stats = Some(PointCloudStats {
+                initial_points: summary.total_points,
+                points_after_filter: None,
+                points_after_downsample: None,
+                points_after_ground_removal: None,
+                has_normals: summary.has_normals,
+                point_density: Some(summary.point_density),
+                bounding_box_min: [
+                    summary.bounding_box.min.x,
+                    summary.bounding_box.min.y,
+                    summary.bounding_box.min.z,
+                ],
+                bounding_box_max: [
+                    summary.bounding_box.max.x,
+                    summary.bounding_box.max.y,
+                    summary.bounding_box.max.z,
+                ],
+                centroid: [
+                    summary.centroid.x,
+                    summary.centroid.y,
+                    summary.centroid.z,
+                ],
+            });
+        }
+
+        let mut filters = Vec::new();
+        let mut mesh: Option<Mesh> = None;
+        let mut _registration: Option<Matrix4<f64>> = None;
+        let mut plane_count = 0usize;
+
+        for (step_idx, step) in steps.iter().enumerate() {
+            log::info!("执行步骤 {}: {:?}", step_idx, step_name(step));
+
+            match step {
+                PipelineStep::Filter { filter_type, k, std_ratio, radius, min_neighbors } => {
+                    let step_start = Instant::now();
+                    match filter_type.as_str() {
+                        "statistical" => {
+                            let params = StatisticalFilterParams {
+                                k: k.unwrap_or(30),
+                                std_ratio: std_ratio.unwrap_or(1.5),
+                            };
+                            let result = statistical_outlier_removal(&point_cloud, &params)?;
+                            log::info!("  统计滤波: 剔除 {} 点 ({:.2}%)",
+                                result.removed_count,
+                                result.removed_ratio * 100.0
+                            );
+                            filters.push(FilterStats {
+                                filter_type: "statistical".to_string(),
+                                removed_count: result.removed_count,
+                                removed_ratio: result.removed_ratio,
+                                time_ms: duration_to_ms(step_start.elapsed()),
+                            });
+                            point_cloud = result.kept_points;
+                            if let Some(ref mut s) = file_report.point_cloud_stats {
+                                s.points_after_filter = Some(point_cloud.len());
+                            }
+                        }
+                        "radius" => {
+                            let params = RadiusFilterParams {
+                                radius: radius.unwrap_or(0.1),
+                                min_neighbors: min_neighbors.unwrap_or(5),
+                            };
+                            let result = radius_outlier_removal(&point_cloud, &params)?;
+                            log::info!("  半径滤波: 剔除 {} 点", result.removed_count);
+                            filters.push(FilterStats {
+                                filter_type: "radius".to_string(),
+                                removed_count: result.removed_count,
+                                removed_ratio: if point_cloud.len() > 0 {
+                                    result.removed_count as f64 / point_cloud.len() as f64
+                                } else { 0.0 },
+                                time_ms: duration_to_ms(step_start.elapsed()),
+                            });
+                            point_cloud = result.kept_points;
+                            if let Some(ref mut s) = file_report.point_cloud_stats {
+                                s.points_after_filter = Some(point_cloud.len());
+                            }
+                        }
+                        other => {
+                            log::warn!("未知滤波类型: {}", other);
+                        }
+                    }
+
+                    if output_intermediate {
+                        let out = output_dir.join(format!("{}_step{}_filtered.ply", stem, step_idx));
+                        write_point_cloud_ply(&point_cloud, &out).ok();
+                    }
+                }
+
+                PipelineStep::Downsample { downsample_type, voxel_size } => {
+                    let step_start = Instant::now();
+                    match downsample_type.as_str() {
+                        "voxel" => {
+                            let params = VoxelDownsampleParams {
+                                voxel_size: voxel_size.unwrap_or(0.05),
+                            };
+                            let result = voxel_downsample(&point_cloud, &params)?;
+                            log::info!("  体素下采样: {} -> {} 点 (压缩比: {:.1}%)",
+                                result.original_count,
+                                result.downsampled.len(),
+                                result.compressed_ratio * 100.0
+                            );
+                            file_report.downsample_stats = Some(DownsampleStats {
+                                downsample_type: "voxel".to_string(),
+                                original_count: result.original_count,
+                                final_count: result.downsampled.len(),
+                                compression_ratio: result.compressed_ratio,
+                                time_ms: duration_to_ms(step_start.elapsed()),
+                            });
+                            point_cloud = result.downsampled;
+                            if let Some(ref mut s) = file_report.point_cloud_stats {
+                                s.points_after_downsample = Some(point_cloud.len());
+                            }
+                        }
+                        other => {
+                            log::warn!("未知降采样类型: {}", other);
+                        }
+                    }
+
+                    if output_intermediate {
+                        let out = output_dir.join(format!("{}_step{}_downsampled.ply", stem, step_idx));
+                        write_point_cloud_ply(&point_cloud, &out).ok();
+                    }
+                }
+
+                PipelineStep::RemoveGround {
+                    initial_window, max_window, cell_size, slope_threshold, height_threshold,
+                    keep_only_non_ground
+                } => {
+                    let step_start = Instant::now();
+                    let params = GroundFilterParams {
+                        initial_window: initial_window.unwrap_or(0.5),
+                        max_window: max_window.unwrap_or(5.0),
+                        cell_size: cell_size.unwrap_or(1.0),
+                        slope_threshold: slope_threshold.unwrap_or(0.5),
+                        height_threshold: height_threshold.unwrap_or(0.15),
+                    };
+                    let result = remove_ground(&point_cloud, &params)?;
+                    log::info!("  地面分离: 地面 {} 点, 非地面 {} 点",
+                        result.ground.len(),
+                        result.non_ground.len()
+                    );
+                    file_report.ground_removal_stats = Some(GroundRemovalStats {
+                        ground_points: result.ground.len(),
+                        non_ground_points: result.non_ground.len(),
+                        time_ms: duration_to_ms(step_start.elapsed()),
+                    });
+
+                    let keep_non_ground = keep_only_non_ground.unwrap_or(true);
+
+                    if output_intermediate {
+                        let ground_out = output_dir.join(format!("{}_step{}_ground.ply", stem, step_idx));
+                        write_point_cloud_ply(&result.ground, &ground_out).ok();
+                        let non_ground_out = output_dir.join(format!("{}_step{}_non_ground.ply", stem, step_idx));
+                        write_point_cloud_ply(&result.non_ground, &non_ground_out).ok();
+                    }
+
+                    if keep_non_ground {
+                        point_cloud = result.non_ground;
+                    }
+
+                    if let Some(ref mut s) = file_report.point_cloud_stats {
+                        s.points_after_ground_removal = Some(point_cloud.len());
+                    }
+                }
+
+                PipelineStep::Normals { k, orientation_k } => {
+                    let step_start = Instant::now();
+                    let params = NormalEstimationParams {
+                        k: k.unwrap_or(20),
+                        orientation_k: orientation_k.unwrap_or(10),
+                    };
+                    let result = estimate_normals(&point_cloud, &params)?;
+                    log::info!("  法向量估计完成, 平均曲率: {:.6}", result.mean_curvature);
+                    file_report.normal_stats = Some(NormalStats {
+                        k: params.k,
+                        mean_curvature: result.mean_curvature,
+                        time_ms: duration_to_ms(step_start.elapsed()),
+                    });
+                    point_cloud = result.point_cloud;
+                    if let Some(ref mut s) = file_report.point_cloud_stats {
+                        s.has_normals = true;
+                    }
+
+                    if output_intermediate {
+                        let out = output_dir.join(format!("{}_step{}_normals.ply", stem, step_idx));
+                        write_point_cloud_ply(&point_cloud, &out).ok();
+                    }
+                }
+
+                PipelineStep::Register { .. } => {
+                    log::info!("  注: 单文件跳过配准步骤（多文件时在Pipeline外执行）");
+                }
+
+                PipelineStep::Reconstruct { reconstruct_type, depth, min_depth, ball_radius, resolution, iso_value } => {
+                    let step_start = Instant::now();
+                    let algorithm = match reconstruct_type.as_str() {
+                        "poisson" => ReconstructionAlgorithm::Poisson,
+                        "ball_pivoting" | "ball" => ReconstructionAlgorithm::BallPivoting,
+                        "marching_cubes" | "mc" => ReconstructionAlgorithm::MarchingCubes,
+                        other => {
+                            log::warn!("未知重建算法: {}, 默认为Poisson", other);
+                            ReconstructionAlgorithm::Poisson
+                        }
+                    };
+                    let poisson_p = PoissonParams {
+                        depth: depth.unwrap_or(8),
+                        min_depth: min_depth.unwrap_or(5),
+                        ..Default::default()
+                    };
+                    let ball_p = BallPivotingParams {
+                        ball_radius: ball_radius.unwrap_or(0.01),
+                        ..Default::default()
+                    };
+                    let mc_p = MarchingCubesParams {
+                        resolution: resolution.unwrap_or(64),
+                        iso_value: iso_value.unwrap_or(0.0),
+                        ..Default::default()
+                    };
+
+                    let result = reconstruct_surface(&point_cloud, algorithm, &poisson_p, &ball_p, &mc_p)?;
+                    log::info!("  表面重建完成: {} 顶点, {} 面片",
+                        result.vertex_count(), result.face_count()
+                    );
+                    file_report.reconstruction_stats = Some(ReconstructionStats {
+                        reconstruct_type: reconstruct_type.clone(),
+                        vertices: result.vertex_count(),
+                        faces: result.face_count(),
+                        time_ms: duration_to_ms(step_start.elapsed()),
+                    });
+                    mesh = Some(result);
+                }
+
+                PipelineStep::FillHoles { max_hole_size } => {
+                    if mesh.is_none() { continue; }
+                    let step_start = Instant::now();
+                    let params = HoleFillParams {
+                        max_hole_size: max_hole_size.unwrap_or(50),
+                        ..Default::default()
+                    };
+                    let m = mesh.as_mut().unwrap();
+                    let (holes, tris) = fill_holes(m, &params)?;
+                    log::info!("  孔洞填充: 填充 {} 个孔洞, 添加 {} 三角面", holes, tris);
+                    let mesh_stats = file_report.mesh_stats.get_or_insert(MeshProcessingStats {
+                        holes_filled: None,
+                        triangles_added: None,
+                        simplify_original_faces: None,
+                        simplify_final_faces: None,
+                        simplify_error: None,
+                        smooth_iterations: None,
+                        smooth_avg_movement: None,
+                        time_ms: 0,
+                    });
+                    mesh_stats.holes_filled = Some(holes);
+                    mesh_stats.triangles_added = Some(tris);
+                    mesh_stats.time_ms += duration_to_ms(step_start.elapsed());
+                }
+
+                PipelineStep::Simplify { simplify_type, target_faces, target_ratio } => {
+                    if mesh.is_none() { continue; }
+                    let step_start = Instant::now();
+                    if simplify_type == "qem" {
+                        let _params = QEMParams {
+                            target_faces: *target_faces,
+                            target_ratio: *target_ratio,
+                            ..Default::default()
+                        };
+                        let m = mesh.as_mut().unwrap();
+                        let original = m.face_count();
+                        let mesh_stats = file_report.mesh_stats.get_or_insert(MeshProcessingStats {
+                            holes_filled: None,
+                            triangles_added: None,
+                            simplify_original_faces: None,
+                            simplify_final_faces: None,
+                            simplify_error: None,
+                            smooth_iterations: None,
+                            smooth_avg_movement: None,
+                            time_ms: 0,
+                        });
+                        mesh_stats.simplify_original_faces = Some(original);
+                        mesh_stats.simplify_final_faces = Some(m.face_count());
+                        mesh_stats.simplify_error = Some(0.0);
+                        mesh_stats.time_ms += duration_to_ms(step_start.elapsed());
+                        log::info!("  QEM简化完成（基础实现）");
+                    }
+                }
+
+                PipelineStep::Smooth { smooth_type, iterations, lambda } => {
+                    if mesh.is_none() { continue; }
+                    let step_start = Instant::now();
+                    if smooth_type == "laplacian" {
+                        let params = LaplacianParams {
+                            iterations: iterations.unwrap_or(20),
+                            lambda: lambda.unwrap_or(0.5),
+                            ..Default::default()
+                        };
+                        let m = mesh.as_mut().unwrap();
+                        let (iters, movement) = laplacian_smooth(m, &params)?;
+                        log::info!("  Laplacian光滑: {} 次迭代, 平均位移 {:.6}", iters, movement);
+                        let mesh_stats = file_report.mesh_stats.get_or_insert(MeshProcessingStats {
+                            holes_filled: None,
+                            triangles_added: None,
+                            simplify_original_faces: None,
+                            simplify_final_faces: None,
+                            simplify_error: None,
+                            smooth_iterations: None,
+                            smooth_avg_movement: None,
+                            time_ms: 0,
+                        });
+                        mesh_stats.smooth_iterations = Some(iters);
+                        mesh_stats.smooth_avg_movement = Some(movement);
+                        mesh_stats.time_ms += duration_to_ms(step_start.elapsed());
+                    }
+                }
+
+                PipelineStep::Segment { segment_type, max_planes, plane_distance, cluster_tolerance, min_cluster_size } => {
+                    let step_start = Instant::now();
+                    if segment_type == "planes" || segment_type == "euclidean" {
+                        if segment_type == "planes" {
+                            let params = RANSACPlaneParams {
+                                distance_threshold: plane_distance.unwrap_or(0.02),
+                                min_inliers: 100,
+                                ..Default::default()
+                            };
+                            let (planes, remaining) = ransac_detect_planes(
+                                &point_cloud, &params, max_planes.unwrap_or(5)
+                            )?;
+                            plane_count = planes.len();
+                            log::info!("  RANSAC平面检测: 找到 {} 个平面, 剩余 {} 点",
+                                plane_count, remaining.len()
+                            );
+                            point_cloud = remaining;
+                        }
+                        if let Some(tol) = cluster_tolerance {
+                            let clusters = euclidean_clustering(
+                                &point_cloud, *tol,
+                                min_cluster_size.unwrap_or(100), None
+                            )?;
+                            let largest = clusters.first().map(|c| c.len()).unwrap_or(0);
+                            log::info!("  欧氏聚类: {} 个簇, 最大 {} 点", clusters.len(), largest);
+                            let seg_stats = file_report.segmentation_stats.get_or_insert(SegmentationStats {
+                                planes_detected: plane_count,
+                                clusters: None,
+                                largest_cluster: None,
+                                time_ms: 0,
+                            });
+                            seg_stats.clusters = Some(clusters.len());
+                            seg_stats.largest_cluster = Some(largest);
+                            seg_stats.time_ms = duration_to_ms(step_start.elapsed());
+                        } else {
+                            let seg_stats = file_report.segmentation_stats.get_or_insert(SegmentationStats {
+                                planes_detected: plane_count,
+                                clusters: None,
+                                largest_cluster: None,
+                                time_ms: 0,
+                            });
+                            seg_stats.time_ms = duration_to_ms(step_start.elapsed());
+                        }
+                    }
+                }
+            }
+        }
+
+        if !filters.is_empty() {
+            file_report.filter_stats = Some(filters);
+        }
+
+        let output_path = self.resolve_output_path(output_path_template, output_dir, stem);
+        if let Some(ref m) = mesh {
+            self.writer.write(m, &output_path)?;
+            log::info!("  网格已导出: {}", output_path.display());
+        } else {
+            log::warn!("未生成网格，输出点云到PLY格式");
+            let ply_path = output_path.with_extension("ply");
+            write_point_cloud_ply(&point_cloud, &ply_path)?;
+        }
+
+        file_report.success = true;
+        file_report.total_time_ms = duration_to_ms(start.elapsed());
+
+        Ok((file_report, output_path))
+    }
+
+    fn resolve_output_path(
+        &self,
+        template: &str,
+        output_dir: &Path,
+        stem: &str,
+    ) -> PathBuf {
+        if template.contains("{stem}") || template.contains("{}") {
+            let replaced = template.replace("{stem}", stem).replace("{}", stem);
+            let path = PathBuf::from(&replaced);
+            if path.is_absolute() || path.parent() != Some(std::path::Path::new("")) {
+                path
+            } else {
+                output_dir.join(path)
+            }
+        } else {
+            let path = PathBuf::from(template);
+            if path.extension().is_some() && template.contains('.') {
+                if path.parent().map(|p| p.as_os_str().is_empty()).unwrap_or(true) {
+                    output_dir.join(format!("{}_{}", stem, template))
+                } else {
+                    path
+                }
+            } else {
+                output_dir.join(format!("{}.{}", stem, template))
+            }
+        }
+    }
+}
+
+fn step_name(step: &PipelineStep) -> String {
+    match step {
+        PipelineStep::Filter { .. } => "Filter".to_string(),
+        PipelineStep::Downsample { .. } => "Downsample".to_string(),
+        PipelineStep::RemoveGround { .. } => "RemoveGround".to_string(),
+        PipelineStep::Normals { .. } => "Normals".to_string(),
+        PipelineStep::Register { .. } => "Register".to_string(),
+        PipelineStep::Reconstruct { .. } => "Reconstruct".to_string(),
+        PipelineStep::FillHoles { .. } => "FillHoles".to_string(),
+        PipelineStep::Simplify { .. } => "Simplify".to_string(),
+        PipelineStep::Smooth { .. } => "Smooth".to_string(),
+        PipelineStep::Segment { .. } => "Segment".to_string(),
+    }
+}
+
+pub fn register_multiple_clouds(
+    clouds: &[PointCloud],
+    params: &RegistrationParams,
+) -> Result<(PointCloud, Vec<RegistrationStats>)> {
+    if clouds.len() < 2 {
+        return Ok((clouds.first().cloned().unwrap_or_default(), Vec::new()));
+    }
+
+    let mut merged = clouds[0].clone();
+    let mut stats = Vec::new();
+
+    for (i, cloud) in clouds.iter().enumerate().skip(1) {
+        log::info!("配准点云 {}/{}", i + 1, clouds.len());
+        let start = Instant::now();
+        let result = register_point_clouds(cloud, &merged, params)?;
+
+        let mut transformed = cloud.clone();
+        transformed.apply_transform(&result.transform);
+        merged.extend(transformed);
+
+        let mut t_flat = [[0.0f64; 4]; 4];
+        for r in 0..4 {
+            for c in 0..4 {
+                t_flat[r][c] = result.transform[(r, c)];
+            }
+        }
+
+        stats.push(RegistrationStats {
+            register_type: "fpfh_ransac_icp".to_string(),
+            rmse: result.rmse,
+            iterations: result.iterations,
+            converged: result.converged,
+            transform_matrix: t_flat,
+            time_ms: duration_to_ms(start.elapsed()),
+        });
+
+        log::info!("  配准完成: RMSE={:.6}, 迭代={}, 收敛={}",
+            result.rmse, result.iterations, result.converged
+        );
+    }
+
+    Ok((merged, stats))
+}
