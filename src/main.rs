@@ -1302,15 +1302,23 @@ fn print_colored_alignment_report(
 
     println!("{}", "\x1b[1m━━━ 质量分级 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
     let (grade, grade_color, comment) = {
+        let rmse_excellent = accuracy.rmse <= avg_spacing * 0.3;
+        let rmse_good = accuracy.rmse <= avg_spacing * 0.7;
         let rmse_ok = accuracy.rmse <= avg_spacing;
+
+        let inlier_excellent = accuracy.inlier_ratio >= 0.85;
+        let inlier_good = accuracy.inlier_ratio >= 0.7;
         let inlier_ok = accuracy.inlier_ratio >= 0.5;
+
+        let overlap_excellent = accuracy.overlap_rate >= 0.85;
+        let overlap_good = accuracy.overlap_rate >= 0.7;
         let overlap_ok = accuracy.overlap_rate >= 0.5;
 
-        if rmse_ok && inlier_ok && overlap_ok {
+        if rmse_excellent && inlier_excellent && overlap_excellent {
             ("优秀", "\x1b[32m", "配准质量优秀，可直接使用")
-        } else if (rmse_ok || inlier_ok) && overlap_ok {
+        } else if rmse_good && inlier_good && overlap_good {
             ("良好", "\x1b[32m", "配准质量良好，可用于大多数场景")
-        } else if overlap_ok {
+        } else if rmse_ok && inlier_ok && overlap_ok {
             ("一般", "\x1b[33m", "配准质量一般，建议检查参数或调整初始位置")
         } else {
             ("较差", "\x1b[31m", "配准质量较差，建议调整参数或手动提供初始变换")

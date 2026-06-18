@@ -954,12 +954,12 @@ pub fn write_point_cloud_xyz(pc: &PointCloud, path: &Path) -> Result<()> {
     let has_colors = pc.has_colors();
 
     for p in &pc.points {
-        write!(writer, "{:.6} {:.6} {:.6}",
+        write!(writer, "{} {} {}",
             p.position.x, p.position.y, p.position.z)?;
 
         if has_normals {
             let n = p.normal.unwrap_or(nalgebra::Vector3::new(0.0, 0.0, 1.0));
-            write!(writer, " {:.6} {:.6} {:.6}", n.x, n.y, n.z)?;
+            write!(writer, " {} {} {}", n.x, n.y, n.z)?;
         }
 
         if has_colors {

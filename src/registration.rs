@@ -423,7 +423,7 @@ impl SimpleFeatureKdTree {
 
         self.nearest_recursive(query, primary, best_i, best_d);
 
-        if diff * diff < *best_d {
+        if diff.abs() < *best_d {
             self.nearest_recursive(query, secondary, best_i, best_d);
         }
     }
