@@ -1866,3 +1866,344 @@ fn bilateral_filter(pc: &PointCloud, sigma_s: f64, sigma_n: f64) -> Result<Point
 pub fn bold(s: &str) -> String {
     format!("\x1b[1m{}\x1b[0m", s)
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualityDiffMetric {
+    pub name: String,
+    pub before: f64,
+    pub after: f64,
+    pub change: f64,
+    pub is_degenerate: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualityDiffResult {
+    pub before: QualityReport,
+    pub after: QualityReport,
+    pub overall_change: f64,
+    pub metrics: Vec<QualityDiffMetric>,
+    pub degenerate_items: Vec<String>,
+    pub threshold: f64,
+    pub meets_threshold: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchQualityItem {
+    pub file_name: String,
+    pub file_path: String,
+    pub report: QualityReport,
+    pub report_after_fix: Option<QualityReport>,
+    pub fixed: bool,
+    pub fixed_output_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchQualityResult {
+    pub items: Vec<BatchQualityItem>,
+    pub total_files: usize,
+    pub low_quality_count: usize,
+    pub fixed_count: usize,
+}
+
+const DEGENERATE_THRESHOLD: f64 = 5.0;
+
+pub fn compare_quality_reports(
+    before: &QualityReport,
+    after: &QualityReport,
+    threshold: f64,
+) -> QualityDiffResult {
+    let mut metrics = Vec::new();
+    let mut degenerate_items = Vec::new();
+
+    let metric_defs = [
+        ("密度均匀性", before.density.score, after.density.score),
+        ("法向量一致性", before.normal.score, after.normal.score),
+        ("重叠区域检测", before.overlap.score, after.overlap.score),
+        ("噪声水平估计", before.noise.score, after.noise.score),
+        ("完整性评估", before.completeness.score, after.completeness.score),
+    ];
+
+    for (name, b, a) in &metric_defs {
+        let change = a - b;
+        let is_degenerate = change < -DEGENERATE_THRESHOLD;
+        metrics.push(QualityDiffMetric {
+            name: name.to_string(),
+            before: *b,
+            after: *a,
+            change,
+            is_degenerate,
+        });
+        if is_degenerate {
+            degenerate_items.push(name.to_string());
+        }
+    }
+
+    let overall_change = after.overall_score - before.overall_score;
+    let meets_threshold = overall_change >= threshold;
+
+    QualityDiffResult {
+        before: before.clone(),
+        after: after.clone(),
+        overall_change,
+        metrics,
+        degenerate_items,
+        threshold,
+        meets_threshold,
+    }
+}
+
+fn change_color(change: f64) -> &'static str {
+    if change > 0.0 {
+        "\x1b[32m"
+    } else if change < 0.0 {
+        "\x1b[31m"
+    } else {
+        "\x1b[37m"
+    }
+}
+
+pub fn print_quality_diff(diff: &QualityDiffResult) {
+    let reset = "\x1b[0m";
+    let bold_code = "\x1b[1m";
+    let cyan = "\x1b[36m";
+    let red = "\x1b[31m";
+    let green = "\x1b[32m";
+
+    println!();
+    println!("{}", bold(&format!("{}  点云质量对比报告  {}", "=".repeat(25), "=".repeat(25))));
+    println!();
+    println!("  {}对比阈值:{} {:.1} 分", cyan, reset, diff.threshold);
+    println!("  {}退化阈值:{} 下降 > {:.1} 分", cyan, reset, DEGENERATE_THRESHOLD);
+    println!();
+
+    println!("  {:<20} {:>10} {:>10} {:>12}", bold("指标"), bold("修复前"), bold("修复后"), bold("变化量"));
+    println!("  {:-<55}", "");
+
+    for m in &diff.metrics {
+        let color = if m.is_degenerate { red } else { change_color(m.change) };
+        let warn = if m.is_degenerate { format!(" {}⚠", red) } else { "".to_string() };
+        println!(
+            "  {:<20} {:>10.1} {:>10.1} {}{:>+12.1}{}{}",
+            m.name,
+            m.before,
+            m.after,
+            color,
+            m.change,
+            reset,
+            warn
+        );
+    }
+
+    println!("  {:-<55}", "");
+
+    let overall_color = if diff.overall_change >= 0.0 { green } else { red };
+    let before_color = score_color(diff.before.overall_score);
+    let after_color = score_color(diff.after.overall_score);
+    println!(
+        "  {:<20} {}{:>10.1}{} {}{:>10.1}{} {}{:>+12.1}{}",
+        bold("综合评分"),
+        before_color, diff.before.overall_score, reset,
+        after_color, diff.after.overall_score, reset,
+        overall_color, diff.overall_change, reset
+    );
+    println!();
+
+    if !diff.degenerate_items.is_empty() {
+        println!("  {}【退化项警告】{}", red, reset);
+        println!("  以下指标修复后反而变差了（下降超过 {:.1} 分）:", DEGENERATE_THRESHOLD);
+        for item in &diff.degenerate_items {
+            println!("    {}• {}{}", red, item, reset);
+        }
+        println!();
+    }
+
+    if diff.meets_threshold {
+        println!("  {}✓ 修复效果达标 (综合评分变化 {:.1} ≥ 阈值 {:.1}){}", green, diff.overall_change, diff.threshold, reset);
+    } else {
+        println!("  {}✗ 修复效果不达标 (综合评分变化 {:.1} < 阈值 {:.1}){}", red, diff.overall_change, diff.threshold, reset);
+    }
+    println!("{}", "=".repeat(66));
+    println!();
+}
+
+pub fn quality_diff_to_json(diff: &QualityDiffResult) -> Result<String> {
+    serde_json::to_string_pretty(diff)
+        .map_err(|e| PointCloudError::JsonError(e))
+}
+
+pub fn run_quality_batch(
+    dir: &std::path::Path,
+    do_fix: bool,
+    output_dir: Option<&std::path::Path>,
+    parallel: usize,
+    params: &QualityAssessmentParams,
+    weights: &QualityWeights,
+) -> Result<BatchQualityResult> {
+    use crate::io::find_point_cloud_files;
+    use std::path::PathBuf;
+
+    let files = find_point_cloud_files(dir)?;
+    if files.is_empty() {
+        return Err(PointCloudError::ConfigError(
+            format!("目录中未找到支持的点云文件: {}", dir.display())
+        ));
+    }
+
+    log::info!("找到 {} 个点云文件", files.len());
+
+    let process_file = |file_path: &PathBuf| -> Result<BatchQualityItem> {
+        let reader = crate::io::PointCloudReader::new();
+        let file_name = file_path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let file_path_str = file_path.to_string_lossy().to_string();
+
+        log::info!("评估: {}", file_name);
+        let pc = reader.read(file_path)?;
+        let report = assess_quality(&pc, params, weights)?;
+
+        let mut item = BatchQualityItem {
+            file_name,
+            file_path: file_path_str,
+            report,
+            report_after_fix: None,
+            fixed: false,
+            fixed_output_path: None,
+        };
+
+        if do_fix && item.report.overall_score < 60.0 {
+            log::info!("  评分 {:.1} < 60, 执行自动修复...", item.report.overall_score);
+            let repair_params = RepairParams::default();
+            let repair_result = auto_repair(&pc, &item.report, &repair_params)?;
+
+            let out_dir = output_dir.unwrap_or_else(|| file_path.parent().unwrap_or(std::path::Path::new(".")));
+            let stem = file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+            let fixed_path = out_dir.join(format!("{}_fixed.ply", stem));
+
+            if let Some(parent) = fixed_path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+
+            crate::io::write_point_cloud_ply(&repair_result.point_cloud, &fixed_path)?;
+            log::info!("  修复后已保存到: {}", fixed_path.display());
+
+            let report_after = assess_quality(&repair_result.point_cloud, params, weights)?;
+
+            item.report_after_fix = Some(report_after);
+            item.fixed = true;
+            item.fixed_output_path = Some(fixed_path.to_string_lossy().to_string());
+        }
+
+        Ok(item)
+    };
+
+    let items: Result<Vec<BatchQualityItem>> = if parallel > 1 {
+        use rayon::prelude::*;
+        files.par_iter()
+            .map(|f| process_file(f))
+            .collect()
+    } else {
+        files.iter()
+            .map(|f| process_file(f))
+            .collect()
+    };
+
+    let mut items = items?;
+
+    items.sort_by(|a, b| a.report.overall_score.partial_cmp(&b.report.overall_score).unwrap_or(std::cmp::Ordering::Equal));
+
+    let low_quality_count = items.iter().filter(|i| i.report.overall_score < 60.0).count();
+    let fixed_count = items.iter().filter(|i| i.fixed).count();
+
+    Ok(BatchQualityResult {
+        items,
+        total_files: files.len(),
+        low_quality_count,
+        fixed_count,
+    })
+}
+
+pub fn print_batch_summary(result: &BatchQualityResult) {
+    let reset = "\x1b[0m";
+    let bold_code = "\x1b[1m";
+    let red = "\x1b[31m";
+    let green = "\x1b[32m";
+    let yellow = "\x1b[33m";
+    let cyan = "\x1b[36m";
+
+    println!();
+    println!("{}", bold(&format!("{}  批量质量评估汇总  {}", "=".repeat(25), "=".repeat(25))));
+    println!();
+    println!("  {}总文件数:{} {}", cyan, reset, result.total_files);
+    println!("  {}低质量文件:{} {}{}{} (评分 < 60)", cyan, reset,
+        if result.low_quality_count > 0 { red } else { green },
+        result.low_quality_count, reset);
+    println!("  {}已修复文件:{} {}", cyan, reset, result.fixed_count);
+    println!();
+
+    println!(
+        "  {:<30} {:>8} {:>10} {:>8} {:>8} {:>8} {:>8} {:>8} {:>6}",
+        bold("文件名"),
+        bold("总点数"),
+        bold("综合评分"),
+        bold("密度"),
+        bold("法向量"),
+        bold("重叠"),
+        bold("噪声"),
+        bold("完整性"),
+        bold("有法向")
+    );
+    println!("  {:-<96}", "");
+
+    for item in &result.items {
+        let r = &item.report;
+        let s_color = if r.overall_score < 60.0 { red } else { score_color(r.overall_score) };
+
+        let score_display = if item.fixed {
+            let after = item.report_after_fix.as_ref().unwrap();
+            let after_color = if after.overall_score < 60.0 { red } else { score_color(after.overall_score) };
+            format!("{}{:.1}{} → {}{:.1}{}",
+                s_color, r.overall_score, reset,
+                after_color, after.overall_score, reset)
+        } else {
+            format!("{}{:.1}{}", s_color, r.overall_score, reset)
+        };
+
+        let has_normals_str = if r.has_normals {
+            format!("{}是{}", green, reset)
+        } else {
+            format!("{}否{}", yellow, reset)
+        };
+
+        println!(
+            "  {:<30} {:>8} {:>19} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8}",
+            item.file_name,
+            r.total_points,
+            score_display,
+            r.density.score,
+            r.normal.score,
+            r.overlap.score,
+            r.noise.score,
+            r.completeness.score,
+            has_normals_str
+        );
+    }
+
+    println!("  {:-<96}", "");
+    println!();
+    println!("  排序: 按综合评分从低到高");
+    println!("  颜色图例: {}好{}  {}中{}  {}差{}  {}低质量警告{}",
+        "\x1b[32m", reset,
+        "\x1b[33m", reset,
+        "\x1b[31m", reset,
+        "\x1b[31m", reset
+    );
+    println!("{}", "=".repeat(106));
+    println!();
+}
+
+pub fn batch_result_to_json(result: &BatchQualityResult) -> Result<String> {
+    serde_json::to_string_pretty(result)
+        .map_err(|e| PointCloudError::JsonError(e))
+}

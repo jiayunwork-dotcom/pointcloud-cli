@@ -86,6 +86,21 @@ pub struct SegmentationStats {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualityDiffInfo {
+    pub reference_file: String,
+    pub overall_score_before: f64,
+    pub overall_score_after: f64,
+    pub overall_change: f64,
+    pub density_change: f64,
+    pub normal_change: f64,
+    pub overlap_change: f64,
+    pub noise_change: f64,
+    pub completeness_change: f64,
+    pub degenerate_items: Vec<String>,
+    pub has_degenerate: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QualityStats {
     pub overall_score: f64,
     pub density_score: f64,
@@ -106,6 +121,8 @@ pub struct QualityStats {
     pub points_removed: Option<usize>,
     pub normals_fixed: Option<usize>,
     pub time_ms: u64,
+    pub diff_info: Option<QualityDiffInfo>,
+    pub has_warnings: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,10 +232,27 @@ impl PipelineReport {
             }
             if let Some(ref qs) = report.quality_stats {
                 let q_color = if qs.overall_score >= 70.0 { "\x1b[32m" } else if qs.overall_score >= 40.0 { "\x1b[33m" } else { "\x1b[31m" };
+                let status = if qs.has_warnings {
+                    format!("{}警告{}", "\x1b[33m", "\x1b[0m")
+                } else if qs.passed {
+                    "通过".to_string()
+                } else {
+                    "未通过".to_string()
+                };
                 println!("  质量: {}{:.1}{}/100 ({})",
                     q_color, qs.overall_score, "\x1b[0m",
-                    if qs.passed { "通过" } else { "未通过" }
+                    status
                 );
+                if let Some(ref diff) = qs.diff_info {
+                    let change_color = if diff.overall_change >= 0.0 { "\x1b[32m" } else { "\x1b[31m" };
+                    println!("    对比参考: {}", diff.reference_file);
+                    println!("    综合评分: {:.1} → {:.1} ({}{:+.1}{})",
+                        diff.overall_score_before, diff.overall_score_after,
+                        change_color, diff.overall_change, "\x1b[0m");
+                    if diff.has_degenerate {
+                        println!("    {}退化项: {:?}{}", "\x1b[31m", diff.degenerate_items, "\x1b[0m");
+                    }
+                }
             }
             if let Some(ref e) = report.error_message {
                 println!("  错误: {}", e);

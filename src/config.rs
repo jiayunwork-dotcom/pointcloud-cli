@@ -129,6 +129,8 @@ pub enum PipelineStep {
         octree_depth: Option<usize>,
         #[serde(default)]
         noise_k: Option<usize>,
+        #[serde(default)]
+        diff_with: Option<String>,
     },
 }
 

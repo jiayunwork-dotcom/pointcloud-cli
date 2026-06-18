@@ -698,7 +698,7 @@ impl PipelineEngine {
                     }
                 }
 
-                PipelineStep::Quality { threshold, weights, assess_completeness, auto_fix, octree_depth, noise_k } => {
+                PipelineStep::Quality { threshold, weights, assess_completeness, auto_fix, octree_depth, noise_k, diff_with } => {
                     let step_start = Instant::now();
                     let threshold_val = threshold.unwrap_or(60.0);
 
@@ -747,6 +747,39 @@ impl PipelineEngine {
                         );
                     }
 
+                    let mut diff_info = None;
+                    let mut has_warnings = false;
+
+                    if let Some(ref ref_path) = diff_with {
+                        log::info!("  加载参考文件进行对比: {}", ref_path);
+                        let reader = crate::io::PointCloudReader::new();
+                        let ref_pc = reader.read(std::path::Path::new(ref_path))?;
+                        let ref_report = assess_quality(&ref_pc, &quality_params, &quality_weights)?;
+
+                        let diff_result = compare_quality_reports(&ref_report, &quality_report, 0.0);
+                        has_warnings = !diff_result.degenerate_items.is_empty();
+
+                        diff_info = Some(QualityDiffInfo {
+                            reference_file: ref_path.clone(),
+                            overall_score_before: ref_report.overall_score,
+                            overall_score_after: quality_report.overall_score,
+                            overall_change: diff_result.overall_change,
+                            density_change: diff_result.metrics[0].change,
+                            normal_change: diff_result.metrics[1].change,
+                            overlap_change: diff_result.metrics[2].change,
+                            noise_change: diff_result.metrics[3].change,
+                            completeness_change: diff_result.metrics[4].change,
+                            degenerate_items: diff_result.degenerate_items.clone(),
+                            has_degenerate: has_warnings,
+                        });
+
+                        if has_warnings {
+                            log::warn!("  发现 {} 个退化项: {:?}", diff_result.degenerate_items.len(), diff_result.degenerate_items);
+                        } else {
+                            log::info!("  对比完成: 综合评分变化 {:+.1}", diff_result.overall_change);
+                        }
+                    }
+
                     file_report.quality_stats = Some(QualityStats {
                         overall_score: quality_report.overall_score,
                         density_score: quality_report.density.score,
@@ -767,7 +800,17 @@ impl PipelineEngine {
                         points_removed,
                         normals_fixed,
                         time_ms: duration_to_ms(step_start.elapsed()),
+                        diff_info,
+                        has_warnings,
                     });
+
+                    if has_warnings {
+                        file_report.success = false;
+                        file_report.error_message = Some(format!(
+                            "质量对比发现退化项: {:?}",
+                            file_report.quality_stats.as_ref().unwrap().diff_info.as_ref().unwrap().degenerate_items
+                        ));
+                    }
 
                     if !passed && !do_auto_fix {
                         return Err(PointCloudError::ConfigError(format!(
@@ -980,13 +1023,14 @@ fn describe_step(step: &PipelineStep) -> String {
             }
             desc
         }
-        PipelineStep::Quality { threshold, weights, assess_completeness, auto_fix, octree_depth, noise_k } => {
+        PipelineStep::Quality { threshold, weights, assess_completeness, auto_fix, octree_depth, noise_k, diff_with } => {
             let mut desc = format!("Quality (阈值={}", threshold.unwrap_or(60.0));
             if weights.is_some() { desc.push_str(", 自定义权重"); }
             if assess_completeness.unwrap_or(false) { desc.push_str(", 完整性评估"); }
             if auto_fix.unwrap_or(false) { desc.push_str(", 自动修复"); }
             if octree_depth.is_some() { desc.push_str(&format!(", octree_depth={}", octree_depth.unwrap())); }
             if noise_k.is_some() { desc.push_str(&format!(", noise_k={}", noise_k.unwrap())); }
+            if diff_with.is_some() { desc.push_str(", 对比模式"); }
             desc.push_str(")");
             desc
         }

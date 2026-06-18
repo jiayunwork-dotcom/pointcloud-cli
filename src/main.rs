@@ -108,6 +108,14 @@ enum Commands {
     },
 
     Quality {
+        #[command(subcommand)]
+        action: QualityActions,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum QualityActions {
+    Assess {
         #[arg(help = "输入点云文件")]
         input: PathBuf,
 
@@ -119,6 +127,61 @@ enum Commands {
 
         #[arg(long, help = "修复后点云输出路径")]
         fix_output: Option<PathBuf>,
+
+        #[arg(long, help = "五项权重,逗号分隔(密度,法向量,重叠,噪声,完整性),自动归一化")]
+        weights: Option<String>,
+
+        #[arg(long, help = "启用完整性评估(封闭曲面)")]
+        assess_completeness: bool,
+
+        #[arg(long, help = "八叉树最大深度 (默认: 6)")]
+        octree_depth: Option<usize>,
+
+        #[arg(long, help = "噪声评估K近邻数 (默认: 15)")]
+        noise_k: Option<usize>,
+    },
+
+    Diff {
+        #[arg(help = "修复前点云文件")]
+        before: PathBuf,
+
+        #[arg(help = "修复后点云文件")]
+        after: PathBuf,
+
+        #[arg(long, help = "以JSON格式输出对比结果")]
+        json: bool,
+
+        #[arg(long, help = "综合评分变化量阈值,低于此值则修复效果不达标 (默认: 0)")]
+        threshold: Option<f64>,
+
+        #[arg(long, help = "五项权重,逗号分隔(密度,法向量,重叠,噪声,完整性),自动归一化")]
+        weights: Option<String>,
+
+        #[arg(long, help = "启用完整性评估(封闭曲面)")]
+        assess_completeness: bool,
+
+        #[arg(long, help = "八叉树最大深度 (默认: 6)")]
+        octree_depth: Option<usize>,
+
+        #[arg(long, help = "噪声评估K近邻数 (默认: 15)")]
+        noise_k: Option<usize>,
+    },
+
+    Batch {
+        #[arg(help = "包含点云文件的目录路径")]
+        input_dir: PathBuf,
+
+        #[arg(long, help = "以JSON格式输出批量结果")]
+        json: bool,
+
+        #[arg(long, help = "对评分低于60的文件自动执行修复")]
+        fix: bool,
+
+        #[arg(long, help = "修复后文件的输出目录 (默认: 原文件同目录)")]
+        output_dir: Option<PathBuf>,
+
+        #[arg(long, help = "并发处理数 (默认: 1, 串行)")]
+        parallel: Option<usize>,
 
         #[arg(long, help = "五项权重,逗号分隔(密度,法向量,重叠,噪声,完整性),自动归一化")]
         weights: Option<String>,
@@ -201,8 +264,8 @@ fn main() {
         Commands::Measure { action } => do_measurement(action),
         Commands::ExampleConfig { output } => write_example_config(output),
         Commands::Benchmark { input } => run_benchmark(&input),
-        Commands::Quality { input, json, fix, fix_output, weights, assess_completeness, octree_depth, noise_k }
-            => run_quality(&input, json, fix, fix_output, weights, assess_completeness, octree_depth, noise_k),
+        Commands::Quality { action }
+            => run_quality(action),
     };
 
     if let Err(e) = result {
@@ -876,7 +939,61 @@ fn run_benchmark(input: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run_quality(
+fn parse_weights(weights_str: Option<String>) -> Result<quality::QualityWeights> {
+    use quality::QualityWeights;
+    if let Some(ws) = weights_str {
+        let parts: Vec<&str> = ws.split(',').collect();
+        if parts.len() != 5 {
+            return Err(PointCloudError::InvalidParameter(
+                "权重需要恰好5个值,用逗号分隔".to_string()
+            ));
+        }
+        let parsed: std::result::Result<Vec<f64>, _> = parts.iter().map(|s| s.parse::<f64>()).collect();
+        match parsed {
+            Ok(w) => QualityWeights::from_slice(&w),
+            Err(_) => {
+                return Err(PointCloudError::InvalidParameter(
+                    "权重值解析失败".to_string()
+                ));
+            }
+        }
+    } else {
+        Ok(QualityWeights::default())
+    }
+}
+
+fn build_quality_params(
+    assess_completeness_flag: bool,
+    octree_depth: Option<usize>,
+    noise_k: Option<usize>,
+) -> quality::QualityAssessmentParams {
+    use quality::QualityAssessmentParams;
+    let mut params = QualityAssessmentParams::default();
+    params.assess_completeness = assess_completeness_flag;
+    if let Some(d) = octree_depth {
+        params.octree_max_depth = d;
+    }
+    if let Some(k) = noise_k {
+        params.noise_k = k;
+    }
+    params
+}
+
+fn run_quality(action: QualityActions) -> Result<()> {
+    match action {
+        QualityActions::Assess { input, json, fix, fix_output, weights, assess_completeness, octree_depth, noise_k } => {
+            run_quality_assess(&input, json, fix, fix_output, weights, assess_completeness, octree_depth, noise_k)
+        }
+        QualityActions::Diff { before, after, json, threshold, weights, assess_completeness, octree_depth, noise_k } => {
+            run_quality_diff(&before, &after, json, threshold.unwrap_or(0.0), weights, assess_completeness, octree_depth, noise_k)
+        }
+        QualityActions::Batch { input_dir, json, fix, output_dir, parallel, weights, assess_completeness, octree_depth, noise_k } => {
+            run_quality_batch(&input_dir, json, fix, output_dir.as_deref(), parallel.unwrap_or(1), weights, assess_completeness, octree_depth, noise_k)
+        }
+    }
+}
+
+fn run_quality_assess(
     input: &Path,
     as_json: bool,
     do_fix: bool,
@@ -887,43 +1004,17 @@ fn run_quality(
     noise_k: Option<usize>,
 ) -> Result<()> {
     use quality::{
-        QualityWeights, QualityAssessmentParams, RepairParams,
+        QualityAssessmentParams, RepairParams,
         assess_quality, auto_repair, print_quality_report, quality_report_to_json,
     };
+
+    let weights = parse_weights(weights_str)?;
+    let params = build_quality_params(assess_completeness_flag, octree_depth, noise_k);
 
     log::info!("读取点云: {}", input.display());
     let reader = io::PointCloudReader::new();
     let pc = reader.read(input)?;
     log::info!("  共 {} 点", pc.len());
-
-    let weights = if let Some(ws) = weights_str {
-        let parts: Vec<&str> = ws.split(',').collect();
-        if parts.len() != 5 {
-            return Err(PointCloudError::InvalidParameter(
-                "权重需要恰好5个值,用逗号分隔".to_string()
-            ));
-        }
-        let parsed: std::result::Result<Vec<f64>, _> = parts.iter().map(|s| s.parse::<f64>()).collect();
-        match parsed {
-            Ok(w) => QualityWeights::from_slice(&w)?,
-            Err(_) => {
-                return Err(PointCloudError::InvalidParameter(
-                    "权重值解析失败".to_string()
-                ));
-            }
-        }
-    } else {
-        QualityWeights::default()
-    };
-
-    let mut params = QualityAssessmentParams::default();
-    params.assess_completeness = assess_completeness_flag;
-    if let Some(d) = octree_depth {
-        params.octree_max_depth = d;
-    }
-    if let Some(k) = noise_k {
-        params.noise_k = k;
-    }
 
     log::info!("执行质量评估...");
     let report = assess_quality(&pc, &params, &weights)?;
@@ -969,6 +1060,87 @@ fn run_quality(
             println!("{}", "\x1b[1m修复后质量:\x1b[0m");
             print_quality_report(&report_after);
         }
+    }
+
+    Ok(())
+}
+
+fn run_quality_diff(
+    before_path: &Path,
+    after_path: &Path,
+    as_json: bool,
+    threshold: f64,
+    weights_str: Option<String>,
+    assess_completeness_flag: bool,
+    octree_depth: Option<usize>,
+    noise_k: Option<usize>,
+) -> Result<()> {
+    use quality::{
+        assess_quality, compare_quality_reports, print_quality_diff, quality_diff_to_json,
+    };
+
+    let weights = parse_weights(weights_str)?;
+    let params = build_quality_params(assess_completeness_flag, octree_depth, noise_k);
+
+    log::info!("读取修复前点云: {}", before_path.display());
+    let reader = io::PointCloudReader::new();
+    let pc_before = reader.read(before_path)?;
+    log::info!("  共 {} 点", pc_before.len());
+
+    log::info!("读取修复后点云: {}", after_path.display());
+    let pc_after = reader.read(after_path)?;
+    log::info!("  共 {} 点", pc_after.len());
+
+    log::info!("评估修复前质量...");
+    let report_before = assess_quality(&pc_before, &params, &weights)?;
+
+    log::info!("评估修复后质量...");
+    let report_after = assess_quality(&pc_after, &params, &weights)?;
+
+    let diff = compare_quality_reports(&report_before, &report_after, threshold);
+
+    if as_json {
+        let json = quality_diff_to_json(&diff)?;
+        println!("{}", json);
+    } else {
+        print_quality_diff(&diff);
+    }
+
+    if !diff.meets_threshold {
+        if !as_json {
+            eprintln!("修复效果不达标");
+        }
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+fn run_quality_batch(
+    dir: &Path,
+    as_json: bool,
+    do_fix: bool,
+    output_dir: Option<&Path>,
+    parallel: usize,
+    weights_str: Option<String>,
+    assess_completeness_flag: bool,
+    octree_depth: Option<usize>,
+    noise_k: Option<usize>,
+) -> Result<()> {
+    use quality::{
+        run_quality_batch as quality_batch, print_batch_summary, batch_result_to_json,
+    };
+
+    let weights = parse_weights(weights_str)?;
+    let params = build_quality_params(assess_completeness_flag, octree_depth, noise_k);
+
+    let result = quality_batch(dir, do_fix, output_dir, parallel, &params, &weights)?;
+
+    if as_json {
+        let json = batch_result_to_json(&result)?;
+        println!("{}", json);
+    } else {
+        print_batch_summary(&result);
     }
 
     Ok(())
