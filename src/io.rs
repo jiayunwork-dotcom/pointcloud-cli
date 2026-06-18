@@ -946,6 +946,49 @@ pub fn write_point_cloud_ply(pc: &PointCloud, path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn write_point_cloud_xyz(pc: &PointCloud, path: &Path) -> Result<()> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
+    let has_normals = pc.has_normals();
+    let has_colors = pc.has_colors();
+
+    for p in &pc.points {
+        write!(writer, "{:.6} {:.6} {:.6}",
+            p.position.x, p.position.y, p.position.z)?;
+
+        if has_normals {
+            let n = p.normal.unwrap_or(nalgebra::Vector3::new(0.0, 0.0, 1.0));
+            write!(writer, " {:.6} {:.6} {:.6}", n.x, n.y, n.z)?;
+        }
+
+        if has_colors {
+            let c = p.color.unwrap_or(Color::white());
+            write!(writer, " {} {} {}", c.r, c.g, c.b)?;
+        }
+
+        writeln!(writer)?;
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
+pub fn write_point_cloud(pc: &PointCloud, path: &Path) -> Result<()> {
+    let ext = path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("ply")
+        .to_lowercase();
+
+    match ext.as_str() {
+        "ply" => write_point_cloud_ply(pc, path),
+        "xyz" => write_point_cloud_xyz(pc, path),
+        _ => Err(PointCloudError::UnsupportedFormat(
+            format!("不支持的点云输出格式: .{} (支持: .ply, .xyz)", ext)
+        )),
+    }
+}
+
 pub fn find_point_cloud_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut result = Vec::new();
     if !dir.is_dir() {

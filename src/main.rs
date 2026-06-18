@@ -1443,12 +1443,12 @@ fn do_align(
             .to_lowercase();
 
         match ext.as_str() {
-            "ply" => {
-                io::write_point_cloud_ply(&transformed, apply_path)?;
+            "ply" | "xyz" => {
+                io::write_point_cloud(&transformed, apply_path)?;
             }
             _ => {
                 return Err(PointCloudError::UnsupportedFormat(
-                    format!("不支持的输出格式: .{} (仅支持.ply用于变换后点云输出)", ext)
+                    format!("不支持的输出格式: .{} (仅支持.ply, .xyz用于变换后点云输出)", ext)
                 ));
             }
         }

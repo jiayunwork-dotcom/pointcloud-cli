@@ -162,28 +162,34 @@ pub fn register_point_clouds(
     };
 
     let inlier_threshold = avg_spacing * params.ransac_inlier_threshold_factor;
+    let mut effective_params = *params;
+    if effective_params.icp_max_correspondence_distance <= 0.0
+        || effective_params.icp_max_correspondence_distance < inlier_threshold {
+        effective_params.icp_max_correspondence_distance = inlier_threshold * 1.5;
+    }
 
     log::info!("平均点间距: {:.6}", avg_spacing);
     log::info!("FPFH半径: {:.6}", fpfh_radius);
     log::info!("RANSAC内点阈值: {:.6}", inlier_threshold);
+    log::info!("ICP最大对应距离: {:.6}", effective_params.icp_max_correspondence_distance);
 
     log::info!("计算源点云FPFH特征 ({}点)...", source_work.len());
     let source_fpfh = compute_fpfh(&source_work, fpfh_radius)?;
     log::info!("计算目标点云FPFH特征 ({}点)...", target_work.len());
     let target_fpfh = compute_fpfh(&target_work, fpfh_radius)?;
 
-    log::info!("执行RANSAC粗配准 (迭代{}次)...", params.ransac_max_iterations);
+    log::info!("执行RANSAC粗配准 (迭代{}次)...", effective_params.ransac_max_iterations);
     let coarse = ransac_registration(
         &source_work, &target_work, &source_fpfh, &target_fpfh,
-        params, inlier_threshold
+        &effective_params, inlier_threshold
     )?;
     log::info!("  粗配准完成: 内点数={}, 初始RMSE={:.6}",
         coarse.inlier_count, coarse.rmse);
 
-    log::info!("执行Point-to-Plane ICP精配准 (最大{}次)...", params.icp_max_iterations);
+    log::info!("执行Point-to-Plane ICP精配准 (最大{}次)...", effective_params.icp_max_iterations);
     let icp = point_to_plane_icp(
         &source_work, &target_work, &coarse.transform,
-        params, inlier_threshold
+        &effective_params, inlier_threshold
     )?;
     log::info!("  精配准完成: 迭代={}, 收敛={}, 最终RMSE={:.6}",
         icp.iterations, icp.converged, icp.rmse);
@@ -302,25 +308,124 @@ fn compute_pfh_features(pi: &Point3D, pj: &Point3D) -> (f64, f64, f64) {
 }
 
 struct SimpleFeatureKdTree {
+    nodes: Vec<KdNode>,
     points: Vec<[f64; FPFH_DIM]>,
+    indices: Vec<usize>,
+}
+
+struct KdNode {
+    split_dim: usize,
+    split_val: f64,
+    left: isize,
+    right: isize,
+    point_idx: usize,
 }
 
 impl SimpleFeatureKdTree {
     fn from_features(f: &[[f64; FPFH_DIM]]) -> Self {
-        SimpleFeatureKdTree { points: f.to_vec() }
+        let n = f.len();
+        let mut indices: Vec<usize> = (0..n).collect();
+        let mut nodes = Vec::with_capacity(n);
+        let points = f.to_vec();
+
+        Self::build_recursive(&points, &mut indices, &mut nodes, 0, n);
+
+        SimpleFeatureKdTree { nodes, points, indices }
+    }
+
+    fn build_recursive(
+        points: &[[f64; FPFH_DIM]],
+        indices: &mut [usize],
+        nodes: &mut Vec<KdNode>,
+        depth: usize,
+        total: usize,
+    ) -> isize {
+        if indices.is_empty() {
+            return -1;
+        }
+
+        let dim = depth % FPFH_DIM;
+        let mid = indices.len() / 2;
+
+        indices.select_nth_unstable_by(mid, |&a, &b| {
+            points[a][dim].partial_cmp(&points[b][dim]).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let point_idx = indices[mid];
+        let split_val = points[point_idx][dim];
+
+        let node_idx = nodes.len();
+        nodes.push(KdNode {
+            split_dim: dim,
+            split_val,
+            left: -1,
+            right: -1,
+            point_idx,
+        });
+
+        if indices.len() > 1 {
+            let (left_part, right_part) = indices.split_at_mut(mid);
+            let right_part = &mut right_part[1..];
+
+            let left_child = Self::build_recursive(
+                points, left_part, nodes, depth + 1, total
+            );
+            let right_child = Self::build_recursive(
+                points, right_part, nodes, depth + 1, total
+            );
+
+            nodes[node_idx].left = left_child;
+            nodes[node_idx].right = right_child;
+        }
+
+        node_idx as isize
     }
 
     fn nearest(&self, query: &[f64; FPFH_DIM]) -> (usize, f64) {
-        let mut best_i = 0usize;
-        let mut best_d = f64::INFINITY;
-        for (i, p) in self.points.iter().enumerate() {
-            let d = fpfh_distance(query, p);
-            if d < best_d {
-                best_d = d;
-                best_i = i;
-            }
+        if self.nodes.is_empty() {
+            return (0, f64::INFINITY);
         }
+
+        let mut best_i = self.nodes[0].point_idx;
+        let mut best_d = fpfh_distance(query, &self.points[best_i]);
+
+        self.nearest_recursive(query, 0, &mut best_i, &mut best_d);
         (best_i, best_d)
+    }
+
+    fn nearest_recursive(
+        &self,
+        query: &[f64; FPFH_DIM],
+        node_idx: isize,
+        best_i: &mut usize,
+        best_d: &mut f64,
+    ) {
+        if node_idx < 0 || (node_idx as usize) >= self.nodes.len() {
+            return;
+        }
+
+        let node = &self.nodes[node_idx as usize];
+        let d = fpfh_distance(query, &self.points[node.point_idx]);
+
+        if d < *best_d {
+            *best_d = d;
+            *best_i = node.point_idx;
+        }
+
+        let dim = node.split_dim;
+        let diff = query[dim] - node.split_val;
+
+        let (primary, secondary) = if diff <= 0.0 {
+            (node.left, node.right)
+        } else {
+            (node.right, node.left)
+        };
+
+        self.nearest_recursive(query, primary, best_i, best_d);
+
+        if diff * diff < *best_d {
+            self.nearest_recursive(query, secondary, best_i, best_d);
+        }
     }
 }
 
@@ -341,13 +446,13 @@ fn ransac_registration(
     let target_feature_tree = SimpleFeatureKdTree::from_features(target_fpfh);
 
     let feature_matches: Vec<(usize, usize)> = (0..n_source)
-        .filter(|&i| {
+        .filter_map(|i| {
             let (best_j, _) = target_feature_tree.nearest(&source_fpfh[i]);
-            best_j < n_target
-        })
-        .map(|i| {
-            let (best_j, _) = target_feature_tree.nearest(&source_fpfh[i]);
-            (i, best_j)
+            if best_j < n_target {
+                Some((i, best_j))
+            } else {
+                None
+            }
         })
         .collect();
 
