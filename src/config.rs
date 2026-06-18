@@ -136,6 +136,8 @@ pub enum PipelineStep {
         source: Option<String>,
         target: Option<String>,
         #[serde(default)]
+        batch_file: Option<String>,
+        #[serde(default)]
         ransac_iterations: Option<usize>,
         #[serde(default)]
         icp_iterations: Option<usize>,
@@ -155,6 +157,10 @@ pub enum PipelineStep {
         output_matrix: Option<String>,
         #[serde(default)]
         pass_transform_to_next: Option<bool>,
+        #[serde(default)]
+        output_sequence: Option<String>,
+        #[serde(default)]
+        init_transform: Option<String>,
     },
 }
 

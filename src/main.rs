@@ -113,11 +113,14 @@ enum Commands {
     },
 
     Align {
-        #[arg(help = "源点云文件")]
-        source: PathBuf,
+        #[arg(help = "源点云文件 (与--batch互斥)")]
+        source: Option<PathBuf>,
 
-        #[arg(help = "目标点云文件")]
-        target: PathBuf,
+        #[arg(help = "目标点云文件 (与--batch互斥)")]
+        target: Option<PathBuf>,
+
+        #[arg(long, help = "批量配准文件列表路径 (每行一个点云文件路径，与source/target互斥)")]
+        batch: Option<PathBuf>,
 
         #[arg(long, default_value_t = 1000, help = "RANSAC迭代次数 (默认: 1000)")]
         ransac_iterations: usize,
@@ -140,11 +143,17 @@ enum Commands {
         #[arg(long, help = "以JSON格式输出精度报告")]
         json: bool,
 
-        #[arg(long, help = "将4x4变换矩阵保存到文本文件")]
+        #[arg(long, help = "将4x4变换矩阵保存到文本文件 (单帧模式)")]
         output_matrix: Option<PathBuf>,
 
-        #[arg(long, help = "将变换应用到源点云并保存到指定文件")]
+        #[arg(long, help = "将变换应用到源点云并保存到指定文件 (单帧模式)")]
         apply: Option<PathBuf>,
+
+        #[arg(long, help = "变换序列输出文件路径 (批量模式)")]
+        output_sequence: Option<PathBuf>,
+
+        #[arg(long, help = "初始变换矩阵文件路径 (用于首次配准，跳过RANSAC直接ICP)")]
+        init_transform: Option<PathBuf>,
     },
 }
 
@@ -301,8 +310,8 @@ fn main() {
         Commands::Benchmark { input } => run_benchmark(&input),
         Commands::Quality { action }
             => run_quality(action),
-        Commands::Align { source, target, ransac_iterations, icp_iterations, icp_threshold, voxel_size, normal_radius, fpfh_radius, json, output_matrix, apply }
-            => do_align(&source, &target, ransac_iterations, icp_iterations, icp_threshold, voxel_size, normal_radius, fpfh_radius, json, output_matrix.as_deref(), apply.as_deref()),
+        Commands::Align { source, target, batch, ransac_iterations, icp_iterations, icp_threshold, voxel_size, normal_radius, fpfh_radius, json, output_matrix, apply, output_sequence, init_transform }
+            => do_align(source.as_deref(), target.as_deref(), batch.as_deref(), ransac_iterations, icp_iterations, icp_threshold, voxel_size, normal_radius, fpfh_radius, json, output_matrix.as_deref(), apply.as_deref(), output_sequence.as_deref(), init_transform.as_deref()),
     };
 
     if let Err(e) = result {
@@ -1334,8 +1343,9 @@ fn print_colored_alignment_report(
 }
 
 fn do_align(
-    source_path: &Path,
-    target_path: &Path,
+    source_path: Option<&Path>,
+    target_path: Option<&Path>,
+    batch_path: Option<&Path>,
     ransac_iterations: usize,
     icp_iterations: usize,
     icp_threshold: f64,
@@ -1345,19 +1355,9 @@ fn do_align(
     as_json: bool,
     output_matrix: Option<&Path>,
     apply_output: Option<&Path>,
+    output_sequence: Option<&Path>,
+    init_transform_path: Option<&Path>,
 ) -> Result<()> {
-    let total_start = std::time::Instant::now();
-
-    let reader = io::PointCloudReader::new();
-
-    log::info!("加载源点云: {}", source_path.display());
-    let source = reader.read(source_path)?;
-    log::info!("  源点数: {}", source.len());
-
-    log::info!("加载目标点云: {}", target_path.display());
-    let target = reader.read(target_path)?;
-    log::info!("  目标点数: {}", target.len());
-
     let mut params = registration::RegistrationParams {
         fpfh_radius: fpfh_radius.unwrap_or(0.0),
         ransac_max_iterations: ransac_iterations,
@@ -1377,10 +1377,66 @@ fn do_align(
         log::info!("将使用体素下采样 (大小={})", voxel_size);
     }
 
-    log::info!("开始配准流程 (RANSAC={}, ICP={}, ICP阈值={:e})...",
-        ransac_iterations, icp_iterations, icp_threshold);
+    if batch_path.is_some() {
+        return do_align_batch(
+            batch_path.unwrap(),
+            params,
+            as_json,
+            output_sequence,
+            init_transform_path,
+        );
+    }
 
-    let reg_result = registration::register_point_clouds(&source, &target, &params)?;
+    let source = source_path.ok_or_else(|| {
+        PointCloudError::InvalidParameter("必须指定source或--batch参数".to_string())
+    })?;
+    let target = target_path.ok_or_else(|| {
+        PointCloudError::InvalidParameter("必须指定target或--batch参数".to_string())
+    })?;
+
+    do_align_single(
+        source,
+        target,
+        params,
+        as_json,
+        output_matrix,
+        apply_output,
+        init_transform_path,
+    )
+}
+
+fn do_align_single(
+    source_path: &Path,
+    target_path: &Path,
+    params: registration::RegistrationParams,
+    as_json: bool,
+    output_matrix: Option<&Path>,
+    apply_output: Option<&Path>,
+    init_transform_path: Option<&Path>,
+) -> Result<()> {
+    let total_start = std::time::Instant::now();
+
+    let reader = io::PointCloudReader::new();
+
+    log::info!("加载源点云: {}", source_path.display());
+    let source = reader.read(source_path)?;
+    log::info!("  源点数: {}", source.len());
+
+    log::info!("加载目标点云: {}", target_path.display());
+    let target = reader.read(target_path)?;
+    log::info!("  目标点数: {}", target.len());
+
+    log::info!("开始配准流程 (RANSAC={}, ICP={}, ICP阈值={:e})...",
+        params.ransac_max_iterations, params.icp_max_iterations, params.icp_convergence_threshold);
+
+    let reg_result = if let Some(init_path) = init_transform_path {
+        log::info!("加载初始变换: {}", init_path.display());
+        let init_tf = registration::load_transform_matrix(init_path)?;
+        registration::register_point_clouds_with_initial(&source, &target, &params, &init_tf)?
+    } else {
+        registration::register_point_clouds(&source, &target, &params)?
+    };
+
     log::info!("配准完成: RMSE={:.6}, 收敛={}, 迭代={}",
         reg_result.rmse, reg_result.converged, reg_result.iterations);
 
@@ -1403,11 +1459,11 @@ fn do_align(
             source_points: accuracy.source_points,
             target_points: accuracy.target_points,
             registration: AlignmentRegistrationInfo {
-                ransac_iterations,
+                ransac_iterations: params.ransac_max_iterations,
                 icp_iterations: reg_result.iterations,
                 icp_converged: reg_result.converged,
                 coarse_inlier_count: reg_result.coarse_inlier_count,
-                voxel_size,
+                voxel_size: params.voxel_size,
                 elapsed_ms: crate::report::duration_to_ms(elapsed),
             },
             accuracy: accuracy.clone(),
@@ -1469,4 +1525,120 @@ fn do_align(
     }
 
     Ok(())
+}
+
+fn do_align_batch(
+    batch_path: &Path,
+    params: registration::RegistrationParams,
+    as_json: bool,
+    output_sequence: Option<&Path>,
+    init_transform_path: Option<&Path>,
+) -> Result<()> {
+    let total_start = std::time::Instant::now();
+
+    log::info!("加载批量配准文件列表: {}", batch_path.display());
+    let file_list = registration::load_batch_file_list(batch_path)?;
+    let n = file_list.len();
+    log::info!("  共 {} 个点云文件", n);
+
+    let init_transform = if let Some(init_path) = init_transform_path {
+        log::info!("加载初始变换: {}", init_path.display());
+        Some(registration::load_transform_matrix(init_path)?)
+    } else {
+        None
+    };
+
+    let reader = io::PointCloudReader::new();
+
+    if !as_json {
+        println!();
+        println!("{}", "\x1b[1m╔══════════════════════════════════════════════════════════════╗\x1b[0m");
+        println!("{}", "\x1b[1m║              点云批量配准 (Batch Registration)              ║\x1b[0m");
+        println!("{}", "\x1b[1m╚══════════════════════════════════════════════════════════════╝\x1b[0m");
+        println!();
+        println!("  总帧数:       {}", n);
+        println!("  基准帧:       {}", file_list[0].display());
+        if init_transform.is_some() {
+            println!("  初始变换:     已提供 (首次配准仅ICP)");
+        }
+        println!();
+    }
+
+    let batch_result = registration::batch_register_point_clouds(
+        &file_list,
+        &params,
+        init_transform.as_ref(),
+        &reader,
+    )?;
+
+    let total_elapsed = total_start.elapsed();
+
+    if as_json {
+        let json = serde_json::to_string_pretty(&batch_result)
+            .map_err(|e| PointCloudError::JsonError(e))?;
+        println!("{}", json);
+    } else {
+        print_batch_regression_progress(&batch_result);
+        println!();
+        print_batch_summary(&batch_result, total_elapsed);
+    }
+
+    if let Some(seq_path) = output_sequence {
+        if let Some(parent) = seq_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).ok();
+            }
+        }
+        registration::save_transform_sequence(&batch_result, seq_path)?;
+        if !as_json {
+            println!();
+            println!("  变换序列已保存到: {}", seq_path.display());
+        } else {
+            log::info!("变换序列已保存到: {}", seq_path.display());
+        }
+    }
+
+    Ok(())
+}
+
+fn print_batch_regression_progress(result: &registration::BatchRegistrationResult) {
+    println!("{}", "\x1b[1m━━━ 配准进度 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
+    let n = result.frames.len();
+
+    for (i, frame) in result.frames.iter().enumerate() {
+        if i == 0 {
+            let pct = 0.0f64;
+            println!("  [{:>3.0}%] 帧 {:>3}/{}: {} (基准帧)",
+                pct, i, n - 1, frame.source_file);
+            continue;
+        }
+
+        let pct = (i as f64 / (n - 1) as f64) * 100.0;
+        let converged_str = if frame.converged {
+            "\x1b[32m✓ 收敛\x1b[0m".to_string()
+        } else {
+            "\x1b[31m✗ 未收敛\x1b[0m".to_string()
+        };
+
+        println!("  [{:>3.0}%] 帧 {:>3}/{}: {} | RMSE: {:.6} | {}",
+            pct, i, n - 1, frame.source_file, frame.rmse, converged_str);
+    }
+}
+
+fn print_batch_summary(result: &registration::BatchRegistrationResult, elapsed: std::time::Duration) {
+    let s = &result.summary;
+
+    println!("{}", "\x1b[1m━━━ 汇总统计 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
+    println!("  总帧数:           {}", s.total_frames);
+    println!("  配准帧数:         {}", s.total_frames - 1);
+    println!("  平均RMSE:         {:.6}", s.average_rmse);
+
+    let max_rmse_colored = colorize_rmse(s.max_rmse, s.average_rmse * 1.5);
+    println!("  最大RMSE:         {} (帧 {})", max_rmse_colored, s.max_rmse_frame);
+
+    let failed_color = if s.failed_frames == 0 { "\x1b[32m" } else { "\x1b[31m" };
+    println!("  收敛失败帧数:     {}{}{}", failed_color, s.failed_frames, "\x1b[0m");
+
+    println!("  总耗时:           {:.2}s", elapsed.as_secs_f64());
+    println!();
 }

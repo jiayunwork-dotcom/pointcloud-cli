@@ -58,6 +58,28 @@ pub struct RegistrationStats {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchRegistrationFrameStats {
+    pub frame_index: usize,
+    pub source_file: String,
+    pub transform_matrix: [[f64; 4]; 4],
+    pub rmse: f64,
+    pub converged: bool,
+    pub has_warning: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchRegistrationStats {
+    pub total_frames: usize,
+    pub average_rmse: f64,
+    pub max_rmse: f64,
+    pub max_rmse_frame: usize,
+    pub failed_frames: usize,
+    pub warning_frames: usize,
+    pub frames: Vec<BatchRegistrationFrameStats>,
+    pub time_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReconstructionStats {
     pub reconstruct_type: String,
     pub vertices: usize,
@@ -137,6 +159,7 @@ pub struct FileProcessingReport {
     pub ground_removal_stats: Option<GroundRemovalStats>,
     pub normal_stats: Option<NormalStats>,
     pub registration_stats: Option<RegistrationStats>,
+    pub batch_registration_stats: Option<BatchRegistrationStats>,
     pub reconstruction_stats: Option<ReconstructionStats>,
     pub mesh_stats: Option<MeshProcessingStats>,
     pub segmentation_stats: Option<SegmentationStats>,

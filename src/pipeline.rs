@@ -241,6 +241,7 @@ impl PipelineEngine {
                         ground_removal_stats: None,
                         normal_stats: None,
                         registration_stats: None,
+                        batch_registration_stats: None,
                         reconstruction_stats: None,
                         mesh_stats: None,
                         segmentation_stats: None,
@@ -318,6 +319,7 @@ impl PipelineEngine {
             ground_removal_stats: None,
             normal_stats: None,
             registration_stats: None,
+            batch_registration_stats: None,
             reconstruction_stats: None,
             mesh_stats: None,
             segmentation_stats: None,
@@ -825,18 +827,8 @@ impl PipelineEngine {
                     }
                 }
 
-                PipelineStep::Align { source, target, ransac_iterations, icp_iterations, icp_threshold, voxel_size, normal_radius, fpfh_radius, rmse_warning_threshold, output_transformed_source, output_matrix, pass_transform_to_next } => {
+                PipelineStep::Align { source, target, batch_file, ransac_iterations, icp_iterations, icp_threshold, voxel_size, normal_radius, fpfh_radius, rmse_warning_threshold, output_transformed_source, output_matrix, pass_transform_to_next, output_sequence, init_transform } => {
                     let step_start = Instant::now();
-
-                    let source_path = source.clone().unwrap_or_else(|| input_path.to_string_lossy().to_string());
-                    let target_path = target.clone().ok_or_else(|| {
-                        PointCloudError::ConfigError("Align步骤需要指定target参数".to_string())
-                    })?;
-
-                    log::info!("  加载源点云: {}", source_path);
-                    let align_source = self.reader.read(Path::new(&source_path))?;
-                    log::info!("  加载目标点云: {}", target_path);
-                    let align_target = self.reader.read(Path::new(&target_path))?;
 
                     let mut reg_params = RegistrationParams::default();
                     reg_params.ransac_max_iterations = ransac_iterations.unwrap_or(1000);
@@ -846,89 +838,214 @@ impl PipelineEngine {
                     reg_params.normal_radius = normal_radius.unwrap_or(0.0);
                     if let Some(r) = fpfh_radius { reg_params.fpfh_radius = *r; }
 
-                    log::info!("  执行配准 (源: {}点, 目标: {}点)...",
-                        align_source.len(), align_target.len());
-                    let reg_result = register_point_clouds(&align_source, &align_target, &reg_params)?;
+                    if let Some(ref batch_path) = batch_file {
+                        log::info!("  批量配准模式: 加载文件列表 {}", batch_path);
+                        let file_list = crate::registration::load_batch_file_list(Path::new(batch_path))?;
+                        let n = file_list.len();
+                        log::info!("  共 {} 个点云文件", n);
 
-                    let accuracy = evaluate_alignment(&align_source, &align_target, &reg_result.transform);
-                    log::info!("  配准完成: RMSE={:.6}, 内点比例={:.1}%, 重叠率={:.1}%",
-                        accuracy.rmse,
-                        accuracy.inlier_ratio * 100.0,
-                        accuracy.overlap_rate * 100.0
-                    );
-
-                    let rmse_warn = rmse_warning_threshold.unwrap_or(f64::INFINITY);
-                    if accuracy.rmse > rmse_warn {
-                        log::warn!("  ⚠ RMSE({:.6}) 超过阈值 ({:.6})", accuracy.rmse, rmse_warn);
-                        file_report.success = false;
-                        let existing_err = file_report.error_message.take().unwrap_or_default();
-                        let prefix = if existing_err.is_empty() {
-                            String::new()
+                        let init_tf = if let Some(ref init_path) = init_transform {
+                            log::info!("  加载初始变换: {}", init_path);
+                            Some(crate::registration::load_transform_matrix(Path::new(init_path))?)
                         } else {
-                            format!("{}; ", existing_err)
+                            None
                         };
-                        file_report.error_message = Some(format!(
-                            "{}配准RMSE超限: {:.6} > {:.6}",
-                            prefix, accuracy.rmse, rmse_warn
-                        ));
-                    }
 
-                    let mut t_flat = [[0.0f64; 4]; 4];
-                    for r in 0..4 {
-                        for c in 0..4 {
-                            t_flat[r][c] = reg_result.transform[(r, c)];
+                        log::info!("  执行批量配准...");
+                        let batch_result = crate::registration::batch_register_point_clouds(
+                            &file_list,
+                            &reg_params,
+                            init_tf.as_ref(),
+                            &self.reader,
+                        )?;
+
+                        let rmse_warn = rmse_warning_threshold.unwrap_or(f64::INFINITY);
+                        let mut warning_frames = 0;
+                        let mut frame_stats = Vec::new();
+                        let mut has_warnings = false;
+
+                        for frame in &batch_result.frames {
+                            let frame_warn = frame.frame_index > 0 && frame.rmse > rmse_warn;
+                            if frame_warn {
+                                warning_frames += 1;
+                                has_warnings = true;
+                                log::warn!("  ⚠ 帧{} RMSE({:.6}) 超过阈值 ({:.6})",
+                                    frame.frame_index, frame.rmse, rmse_warn);
+                            }
+                            frame_stats.push(crate::report::BatchRegistrationFrameStats {
+                                frame_index: frame.frame_index,
+                                source_file: frame.source_file.clone(),
+                                transform_matrix: frame.transform_matrix,
+                                rmse: frame.rmse,
+                                converged: frame.converged,
+                                has_warning: frame_warn,
+                            });
                         }
-                    }
 
-                    file_report.registration_stats = Some(RegistrationStats {
-                        register_type: "fpfh_ransac_icp".to_string(),
-                        rmse: accuracy.rmse,
-                        iterations: reg_result.iterations,
-                        converged: reg_result.converged,
-                        transform_matrix: t_flat,
-                        time_ms: duration_to_ms(step_start.elapsed()),
-                    });
+                        if has_warnings {
+                            file_report.success = false;
+                            let existing_err = file_report.error_message.take().unwrap_or_default();
+                            let prefix = if existing_err.is_empty() {
+                                String::new()
+                            } else {
+                                format!("{}; ", existing_err)
+                            };
+                            file_report.error_message = Some(format!(
+                                "{}批量配准有 {} 帧RMSE超限",
+                                prefix, warning_frames
+                            ));
+                        }
 
-                    if let Some(ref out_path) = output_matrix {
-                        let resolved = if Path::new(out_path).is_absolute() {
-                            PathBuf::from(out_path)
+                        file_report.batch_registration_stats = Some(crate::report::BatchRegistrationStats {
+                            total_frames: batch_result.summary.total_frames,
+                            average_rmse: batch_result.summary.average_rmse,
+                            max_rmse: batch_result.summary.max_rmse,
+                            max_rmse_frame: batch_result.summary.max_rmse_frame,
+                            failed_frames: batch_result.summary.failed_frames,
+                            warning_frames,
+                            frames: frame_stats,
+                            time_ms: duration_to_ms(step_start.elapsed()),
+                        });
+
+                        log::info!("  批量配准完成: 平均RMSE={:.6}, 失败帧={}, 警告帧={}",
+                            batch_result.summary.average_rmse,
+                            batch_result.summary.failed_frames,
+                            warning_frames
+                        );
+
+                        if let Some(ref out_path) = output_sequence {
+                            let resolved = if Path::new(out_path).is_absolute() {
+                                PathBuf::from(out_path)
+                            } else {
+                                output_dir.join(out_path)
+                            };
+                            if let Some(parent) = resolved.parent() {
+                                std::fs::create_dir_all(parent).ok();
+                            }
+                            crate::registration::save_transform_sequence(&batch_result, &resolved).ok();
+                            log::info!("  变换序列已保存: {}", resolved.display());
+                        }
+
+                        if pass_transform_to_next.unwrap_or(false) && !batch_result.frames.is_empty() {
+                            log::info!("  将最后一帧变换应用到当前处理的点云");
+                            let last_tf = &batch_result.frames.last().unwrap().transform_matrix;
+                            let mut m = Matrix4::identity();
+                            for r in 0..4 {
+                                for c in 0..4 {
+                                    m[(r, c)] = last_tf[r][c];
+                                }
+                            }
+                            point_cloud.apply_transform(&m);
+                        }
+                    } else {
+                        let source_path = source.clone().unwrap_or_else(|| input_path.to_string_lossy().to_string());
+                        let target_path = target.clone().ok_or_else(|| {
+                            PointCloudError::ConfigError("Align步骤需要指定target参数".to_string())
+                        })?;
+
+                        log::info!("  加载源点云: {}", source_path);
+                        let align_source = self.reader.read(Path::new(&source_path))?;
+                        log::info!("  加载目标点云: {}", target_path);
+                        let align_target = self.reader.read(Path::new(&target_path))?;
+
+                        let init_tf = if let Some(ref init_path) = init_transform {
+                            log::info!("  加载初始变换: {}", init_path);
+                            Some(crate::registration::load_transform_matrix(Path::new(init_path))?)
                         } else {
-                            output_dir.join(out_path)
+                            None
                         };
-                        if let Some(parent) = resolved.parent() {
-                            std::fs::create_dir_all(parent).ok();
-                        }
-                        save_transform_matrix(&reg_result.transform, &resolved).ok();
-                        log::info!("  变换矩阵已保存: {}", resolved.display());
-                    }
 
-                    if let Some(ref out_path) = output_transformed_source {
-                        let resolved = if Path::new(out_path).is_absolute() {
-                            PathBuf::from(out_path)
+                        log::info!("  执行配准 (源: {}点, 目标: {}点)...",
+                            align_source.len(), align_target.len());
+
+                        let reg_result = if let Some(ref tf) = init_tf {
+                            crate::registration::register_point_clouds_with_initial(
+                                &align_source, &align_target, &reg_params, tf
+                            )?
                         } else {
-                            output_dir.join(out_path)
+                            register_point_clouds(&align_source, &align_target, &reg_params)?
                         };
-                        let mut transformed_src = align_source.clone();
-                        transformed_src.apply_transform(&reg_result.transform);
-                        if let Some(parent) = resolved.parent() {
-                            std::fs::create_dir_all(parent).ok();
-                        }
-                        write_point_cloud_ply(&transformed_src, &resolved).ok();
-                        log::info!("  变换后源点云已保存: {}", resolved.display());
-                    }
 
-                    if pass_transform_to_next.unwrap_or(false) {
-                        log::info!("  将变换应用到当前处理的点云");
-                        point_cloud.apply_transform(&reg_result.transform);
-                    }
+                        let accuracy = evaluate_alignment(&align_source, &align_target, &reg_result.transform);
+                        log::info!("  配准完成: RMSE={:.6}, 内点比例={:.1}%, 重叠率={:.1}%",
+                            accuracy.rmse,
+                            accuracy.inlier_ratio * 100.0,
+                            accuracy.overlap_rate * 100.0
+                        );
 
-                    if output_intermediate {
-                        let out = output_dir.join(format!("{}_step{}_aligned.ply", stem, step_idx));
-                        let mut pc_copy = point_cloud.clone();
-                        if !pass_transform_to_next.unwrap_or(false) {
-                            pc_copy.apply_transform(&reg_result.transform);
+                        let rmse_warn = rmse_warning_threshold.unwrap_or(f64::INFINITY);
+                        if accuracy.rmse > rmse_warn {
+                            log::warn!("  ⚠ RMSE({:.6}) 超过阈值 ({:.6})", accuracy.rmse, rmse_warn);
+                            file_report.success = false;
+                            let existing_err = file_report.error_message.take().unwrap_or_default();
+                            let prefix = if existing_err.is_empty() {
+                                String::new()
+                            } else {
+                                format!("{}; ", existing_err)
+                            };
+                            file_report.error_message = Some(format!(
+                                "{}配准RMSE超限: {:.6} > {:.6}",
+                                prefix, accuracy.rmse, rmse_warn
+                            ));
                         }
-                        write_point_cloud_ply(&pc_copy, &out).ok();
+
+                        let mut t_flat = [[0.0f64; 4]; 4];
+                        for r in 0..4 {
+                            for c in 0..4 {
+                                t_flat[r][c] = reg_result.transform[(r, c)];
+                            }
+                        }
+
+                        file_report.registration_stats = Some(RegistrationStats {
+                            register_type: "fpfh_ransac_icp".to_string(),
+                            rmse: accuracy.rmse,
+                            iterations: reg_result.iterations,
+                            converged: reg_result.converged,
+                            transform_matrix: t_flat,
+                            time_ms: duration_to_ms(step_start.elapsed()),
+                        });
+
+                        if let Some(ref out_path) = output_matrix {
+                            let resolved = if Path::new(out_path).is_absolute() {
+                                PathBuf::from(out_path)
+                            } else {
+                                output_dir.join(out_path)
+                            };
+                            if let Some(parent) = resolved.parent() {
+                                std::fs::create_dir_all(parent).ok();
+                            }
+                            save_transform_matrix(&reg_result.transform, &resolved).ok();
+                            log::info!("  变换矩阵已保存: {}", resolved.display());
+                        }
+
+                        if let Some(ref out_path) = output_transformed_source {
+                            let resolved = if Path::new(out_path).is_absolute() {
+                                PathBuf::from(out_path)
+                            } else {
+                                output_dir.join(out_path)
+                            };
+                            let mut transformed_src = align_source.clone();
+                            transformed_src.apply_transform(&reg_result.transform);
+                            if let Some(parent) = resolved.parent() {
+                                std::fs::create_dir_all(parent).ok();
+                            }
+                            write_point_cloud_ply(&transformed_src, &resolved).ok();
+                            log::info!("  变换后源点云已保存: {}", resolved.display());
+                        }
+
+                        if pass_transform_to_next.unwrap_or(false) {
+                            log::info!("  将变换应用到当前处理的点云");
+                            point_cloud.apply_transform(&reg_result.transform);
+                        }
+
+                        if output_intermediate {
+                            let out = output_dir.join(format!("{}_step{}_aligned.ply", stem, step_idx));
+                            let mut pc_copy = point_cloud.clone();
+                            if !pass_transform_to_next.unwrap_or(false) {
+                                pc_copy.apply_transform(&reg_result.transform);
+                            }
+                            write_point_cloud_ply(&pc_copy, &out).ok();
+                        }
                     }
                 }
             }
@@ -1142,14 +1259,19 @@ fn describe_step(step: &PipelineStep) -> String {
             desc.push_str(")");
             desc
         }
-        PipelineStep::Align { source, target, ransac_iterations, icp_iterations, icp_threshold, voxel_size, normal_radius, fpfh_radius, rmse_warning_threshold, output_transformed_source, output_matrix, pass_transform_to_next } => {
+        PipelineStep::Align { source, target, batch_file, ransac_iterations, icp_iterations, icp_threshold, voxel_size, normal_radius, fpfh_radius, rmse_warning_threshold, output_transformed_source, output_matrix, pass_transform_to_next, output_sequence, init_transform } => {
             let mut desc = format!("Align (");
-            if let Some(s) = source { desc.push_str(&format!("源: {}, ", s)); }
-            if let Some(t) = target { desc.push_str(&format!("目标: {}", t)); }
+            if let Some(b) = batch_file {
+                desc.push_str(&format!("批量: {}, ", b));
+            } else {
+                if let Some(s) = source { desc.push_str(&format!("源: {}, ", s)); }
+                if let Some(t) = target { desc.push_str(&format!("目标: {}", t)); }
+            }
             desc.push_str(&format!(", RANSAC迭代={}", ransac_iterations.unwrap_or(1000)));
             desc.push_str(&format!(", ICP迭代={}", icp_iterations.unwrap_or(50)));
             if let Some(v) = voxel_size { if *v > 0.0 { desc.push_str(&format!(", voxel={}", v)); } }
             if let Some(t) = rmse_warning_threshold { desc.push_str(&format!(", RMSE阈值={}", t)); }
+            if init_transform.is_some() { desc.push_str(", 初始变换"); }
             if pass_transform_to_next.unwrap_or(false) { desc.push_str(", 传递变换"); }
             desc.push_str(")");
             desc

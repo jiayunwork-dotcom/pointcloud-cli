@@ -887,3 +887,244 @@ pub fn load_transform_matrix(path: &std::path::Path) -> Result<Matrix4<f64>> {
     }
     Ok(m)
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchFrameResult {
+    pub frame_index: usize,
+    pub source_file: String,
+    pub transform_matrix: [[f64; 4]; 4],
+    pub rmse: f64,
+    pub converged: bool,
+    pub inlier_count: usize,
+    pub iterations: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchRegistrationSummary {
+    pub total_frames: usize,
+    pub average_rmse: f64,
+    pub max_rmse: f64,
+    pub max_rmse_frame: usize,
+    pub failed_frames: usize,
+    pub total_time_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchRegistrationResult {
+    pub frames: Vec<BatchFrameResult>,
+    pub summary: BatchRegistrationSummary,
+}
+
+pub fn load_batch_file_list(batch_path: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
+    let content = std::fs::read_to_string(batch_path)
+        .map_err(|e| PointCloudError::IoError(e))?;
+    let mut files = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        files.push(std::path::PathBuf::from(trimmed));
+    }
+    if files.len() < 2 {
+        return Err(PointCloudError::InvalidParameter(
+            "批量配准需要至少2个点云文件".to_string()
+        ));
+    }
+    Ok(files)
+}
+
+pub fn register_point_clouds_with_initial(
+    source: &PointCloud,
+    target: &PointCloud,
+    params: &RegistrationParams,
+    initial_transform: &Matrix4<f64>,
+) -> Result<RegistrationResult> {
+    if source.is_empty() || target.is_empty() {
+        return Err(PointCloudError::EmptyPointCloud);
+    }
+
+    let mut source_work = source.clone();
+    let mut target_work = target.clone();
+
+    if params.voxel_size > 0.0 {
+        use crate::preprocess::{voxel_downsample, VoxelDownsampleParams};
+        let ds_params = VoxelDownsampleParams { voxel_size: params.voxel_size };
+        source_work = voxel_downsample(&source_work, &ds_params)?.downsampled;
+        target_work = voxel_downsample(&target_work, &ds_params)?.downsampled;
+    }
+
+    ensure_normals(&mut source_work, params.normal_radius)?;
+    ensure_normals(&mut target_work, params.normal_radius)?;
+
+    let avg_spacing = compute_average_point_spacing(&target_work, 500);
+    let inlier_threshold = avg_spacing * params.ransac_inlier_threshold_factor;
+    let mut effective_params = *params;
+    if effective_params.icp_max_correspondence_distance <= 0.0
+        || effective_params.icp_max_correspondence_distance < inlier_threshold {
+        effective_params.icp_max_correspondence_distance = inlier_threshold * 1.5;
+    }
+
+    log::info!("平均点间距: {:.6}", avg_spacing);
+    log::info!("ICP最大对应距离: {:.6}", effective_params.icp_max_correspondence_distance);
+    log::info!("使用初始变换执行Point-to-Plane ICP精配准 (最大{}次)...", effective_params.icp_max_iterations);
+
+    let icp = point_to_plane_icp(
+        &source_work, &target_work, initial_transform,
+        &effective_params, inlier_threshold
+    )?;
+    log::info!("  精配准完成: 迭代={}, 收敛={}, 最终RMSE={:.6}",
+        icp.iterations, icp.converged, icp.rmse);
+
+    Ok(RegistrationResult {
+        transform: icp.transform,
+        rmse: icp.rmse,
+        inlier_count: icp.inlier_count,
+        iterations: icp.iterations,
+        converged: icp.converged,
+        coarse_transform: *initial_transform,
+        coarse_inlier_count: 0,
+    })
+}
+
+pub fn batch_register_point_clouds(
+    file_list: &[std::path::PathBuf],
+    params: &RegistrationParams,
+    init_transform: Option<&Matrix4<f64>>,
+    reader: &crate::io::PointCloudReader,
+) -> Result<BatchRegistrationResult> {
+    let total_start = std::time::Instant::now();
+    let n = file_list.len();
+
+    if n < 2 {
+        return Err(PointCloudError::InvalidParameter(
+            "批量配准需要至少2个点云文件".to_string()
+        ));
+    }
+
+    let mut frames: Vec<BatchFrameResult> = Vec::with_capacity(n);
+    let mut cumulative_transform = Matrix4::identity();
+
+    for i in 0..n {
+        let frame_path = &file_list[i];
+
+        if i == 0 {
+            let identity = Matrix4::identity();
+            let mut t_flat = [[0.0f64; 4]; 4];
+            for r in 0..4 {
+                for c in 0..4 {
+                    t_flat[r][c] = identity[(r, c)];
+                }
+            }
+            frames.push(BatchFrameResult {
+                frame_index: 0,
+                source_file: frame_path.to_string_lossy().to_string(),
+                transform_matrix: t_flat,
+                rmse: 0.0,
+                converged: true,
+                inlier_count: 0,
+                iterations: 0,
+            });
+            continue;
+        }
+
+        log::info!("--- 第 {}/{} 帧: 配准 {} -> {} ---",
+            i, n - 1,
+            frame_path.display(),
+            file_list[i - 1].display()
+        );
+
+        let source = reader.read(frame_path)?;
+        let target = reader.read(&file_list[i - 1])?;
+
+        let reg_result = if i == 1 && init_transform.is_some() {
+            register_point_clouds_with_initial(
+                &source, &target, params, init_transform.unwrap()
+            )?
+        } else {
+            register_point_clouds(&source, &target, params)?
+        };
+
+        cumulative_transform = cumulative_transform * reg_result.transform;
+
+        let mut t_flat = [[0.0f64; 4]; 4];
+        for r in 0..4 {
+            for c in 0..4 {
+                t_flat[r][c] = cumulative_transform[(r, c)];
+            }
+        }
+
+        let accuracy = evaluate_alignment(&source, &target, &reg_result.transform);
+
+        frames.push(BatchFrameResult {
+            frame_index: i,
+            source_file: frame_path.to_string_lossy().to_string(),
+            transform_matrix: t_flat,
+            rmse: accuracy.rmse,
+            converged: reg_result.converged,
+            inlier_count: reg_result.inlier_count,
+            iterations: reg_result.iterations,
+        });
+
+        log::info!("  第{}帧完成: RMSE={:.6}, 收敛={}",
+            i, accuracy.rmse, reg_result.converged);
+    }
+
+    let mut sum_rmse = 0.0;
+    let mut max_rmse = 0.0;
+    let mut max_rmse_frame = 0;
+    let mut failed_frames = 0;
+
+    for (i, frame) in frames.iter().enumerate() {
+        if i == 0 { continue; }
+        sum_rmse += frame.rmse;
+        if frame.rmse > max_rmse {
+            max_rmse = frame.rmse;
+            max_rmse_frame = i;
+        }
+        if !frame.converged {
+            failed_frames += 1;
+        }
+    }
+
+    let avg_rmse = if n > 1 {
+        sum_rmse / (n - 1) as f64
+    } else {
+        0.0
+    };
+
+    let summary = BatchRegistrationSummary {
+        total_frames: n,
+        average_rmse: avg_rmse,
+        max_rmse,
+        max_rmse_frame,
+        failed_frames,
+        total_time_ms: crate::report::duration_to_ms(total_start.elapsed()),
+    };
+
+    Ok(BatchRegistrationResult {
+        frames,
+        summary,
+    })
+}
+
+pub fn save_transform_sequence(
+    result: &BatchRegistrationResult,
+    path: &std::path::Path,
+) -> Result<()> {
+    let mut content = String::new();
+    for frame in &result.frames {
+        let mut row = format!("{} {}", frame.frame_index, frame.source_file);
+        for r in 0..4 {
+            for c in 0..4 {
+                row.push_str(&format!(" {:.15e}", frame.transform_matrix[r][c]));
+            }
+        }
+        row.push_str(&format!(" {:.10}", frame.rmse));
+        content.push_str(&row);
+        content.push('\n');
+    }
+    std::fs::write(path, content)
+        .map_err(|e| PointCloudError::IoError(e))?;
+    Ok(())
+}
