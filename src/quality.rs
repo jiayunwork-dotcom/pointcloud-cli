@@ -1231,6 +1231,25 @@ pub fn auto_repair(
             initial_bbox, final_bbox);
     }
 
+    // 整体质量回滚：如果修复后重叠率比修前更差，回滚
+    if quality_report.overlap.score < 70.0 {
+        let params_assess = QualityAssessmentParams::default();
+        if let Ok(new_overlap) = assess_overlap(&pc, &params_assess) {
+            if new_overlap.overlap_rate > quality_report.overlap.overlap_rate * 1.05 {
+                log::error!("修复后重叠率({:.2}%)比修前({:.2}%)更差,回滚到原始点云",
+                    new_overlap.overlap_rate * 100.0,
+                    quality_report.overlap.overlap_rate * 100.0);
+                return Ok(RepairResult {
+                    point_cloud: original_pc,
+                    points_added: 0,
+                    points_removed: 0,
+                    normals_fixed: 0,
+                    iterations: 0,
+                });
+            }
+        }
+    }
+
     let _ = final_count;
     Ok(RepairResult {
         point_cloud: pc,
