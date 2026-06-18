@@ -757,26 +757,26 @@ impl PipelineEngine {
                         let ref_report = assess_quality(&ref_pc, &quality_params, &quality_weights)?;
 
                         let diff_result = compare_quality_reports(&ref_report, &quality_report, 0.0);
-                        has_warnings = !diff_result.degenerate_items.is_empty();
+                        has_warnings = !diff_result.diff.degenerate_items.is_empty();
 
                         diff_info = Some(QualityDiffInfo {
                             reference_file: ref_path.clone(),
                             overall_score_before: ref_report.overall_score,
                             overall_score_after: quality_report.overall_score,
-                            overall_change: diff_result.overall_change,
-                            density_change: diff_result.metrics[0].change,
-                            normal_change: diff_result.metrics[1].change,
-                            overlap_change: diff_result.metrics[2].change,
-                            noise_change: diff_result.metrics[3].change,
-                            completeness_change: diff_result.metrics[4].change,
-                            degenerate_items: diff_result.degenerate_items.clone(),
+                            overall_change: diff_result.diff.overall_change,
+                            density_change: diff_result.diff.metrics[0].change,
+                            normal_change: diff_result.diff.metrics[1].change,
+                            overlap_change: diff_result.diff.metrics[2].change,
+                            noise_change: diff_result.diff.metrics[3].change,
+                            completeness_change: diff_result.diff.metrics[4].change,
+                            degenerate_items: diff_result.diff.degenerate_items.clone(),
                             has_degenerate: has_warnings,
                         });
 
                         if has_warnings {
-                            log::warn!("  发现 {} 个退化项: {:?}", diff_result.degenerate_items.len(), diff_result.degenerate_items);
+                            log::warn!("  发现 {} 个退化项: {:?}", diff_result.diff.degenerate_items.len(), diff_result.diff.degenerate_items);
                         } else {
-                            log::info!("  对比完成: 综合评分变化 {:+.1}", diff_result.overall_change);
+                            log::info!("  对比完成: 综合评分变化 {:+.1}", diff_result.diff.overall_change);
                         }
                     }
 

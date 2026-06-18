@@ -1877,14 +1877,19 @@ pub struct QualityDiffMetric {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QualityDiffResult {
-    pub before: QualityReport,
-    pub after: QualityReport,
+pub struct QualityDiffDetail {
     pub overall_change: f64,
     pub metrics: Vec<QualityDiffMetric>,
     pub degenerate_items: Vec<String>,
     pub threshold: f64,
     pub meets_threshold: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualityDiffResult {
+    pub before_report: QualityReport,
+    pub after_report: QualityReport,
+    pub diff: QualityDiffDetail,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1942,13 +1947,15 @@ pub fn compare_quality_reports(
     let meets_threshold = overall_change >= threshold;
 
     QualityDiffResult {
-        before: before.clone(),
-        after: after.clone(),
-        overall_change,
-        metrics,
-        degenerate_items,
-        threshold,
-        meets_threshold,
+        before_report: before.clone(),
+        after_report: after.clone(),
+        diff: QualityDiffDetail {
+            overall_change,
+            metrics,
+            degenerate_items,
+            threshold,
+            meets_threshold,
+        },
     }
 }
 
@@ -1962,12 +1969,14 @@ fn change_color(change: f64) -> &'static str {
     }
 }
 
-pub fn print_quality_diff(diff: &QualityDiffResult) {
+pub fn print_quality_diff(diff_result: &QualityDiffResult) {
     let reset = "\x1b[0m";
-    let bold_code = "\x1b[1m";
     let cyan = "\x1b[36m";
     let red = "\x1b[31m";
     let green = "\x1b[32m";
+    let diff = &diff_result.diff;
+    let before = &diff_result.before_report;
+    let after = &diff_result.after_report;
 
     println!();
     println!("{}", bold(&format!("{}  点云质量对比报告  {}", "=".repeat(25), "=".repeat(25))));
@@ -1997,13 +2006,13 @@ pub fn print_quality_diff(diff: &QualityDiffResult) {
     println!("  {:-<55}", "");
 
     let overall_color = if diff.overall_change >= 0.0 { green } else { red };
-    let before_color = score_color(diff.before.overall_score);
-    let after_color = score_color(diff.after.overall_score);
+    let before_color = score_color(before.overall_score);
+    let after_color = score_color(after.overall_score);
     println!(
         "  {:<20} {}{:>10.1}{} {}{:>10.1}{} {}{:>+12.1}{}",
         bold("综合评分"),
-        before_color, diff.before.overall_score, reset,
-        after_color, diff.after.overall_score, reset,
+        before_color, before.overall_score, reset,
+        after_color, after.overall_score, reset,
         overall_color, diff.overall_change, reset
     );
     println!();
@@ -2051,7 +2060,12 @@ pub fn run_quality_batch(
 
     log::info!("找到 {} 个点云文件", files.len());
 
-    let process_file = |file_path: &PathBuf| -> Result<BatchQualityItem> {
+    let total_files = files.len();
+    let params_clone = params.clone();
+    let weights_clone = weights.clone();
+    let output_dir_owned = output_dir.map(|p| p.to_path_buf());
+
+    let process_one = move |file_path: PathBuf| -> Result<BatchQualityItem> {
         let reader = crate::io::PointCloudReader::new();
         let file_name = file_path.file_name()
             .and_then(|s| s.to_str())
@@ -2060,8 +2074,8 @@ pub fn run_quality_batch(
         let file_path_str = file_path.to_string_lossy().to_string();
 
         log::info!("评估: {}", file_name);
-        let pc = reader.read(file_path)?;
-        let report = assess_quality(&pc, params, weights)?;
+        let pc = reader.read(&file_path)?;
+        let report = assess_quality(&pc, &params_clone, &weights_clone)?;
 
         let mut item = BatchQualityItem {
             file_name,
@@ -2077,7 +2091,8 @@ pub fn run_quality_batch(
             let repair_params = RepairParams::default();
             let repair_result = auto_repair(&pc, &item.report, &repair_params)?;
 
-            let out_dir = output_dir.unwrap_or_else(|| file_path.parent().unwrap_or(std::path::Path::new(".")));
+            let out_dir = output_dir_owned.as_deref()
+                .unwrap_or_else(|| file_path.parent().unwrap_or(std::path::Path::new(".")));
             let stem = file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
             let fixed_path = out_dir.join(format!("{}_fixed.ply", stem));
 
@@ -2088,7 +2103,7 @@ pub fn run_quality_batch(
             crate::io::write_point_cloud_ply(&repair_result.point_cloud, &fixed_path)?;
             log::info!("  修复后已保存到: {}", fixed_path.display());
 
-            let report_after = assess_quality(&repair_result.point_cloud, params, weights)?;
+            let report_after = assess_quality(&repair_result.point_cloud, &params_clone, &weights_clone)?;
 
             item.report_after_fix = Some(report_after);
             item.fixed = true;
@@ -2099,13 +2114,20 @@ pub fn run_quality_batch(
     };
 
     let items: Result<Vec<BatchQualityItem>> = if parallel > 1 {
-        use rayon::prelude::*;
-        files.par_iter()
-            .map(|f| process_file(f))
-            .collect()
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(parallel)
+            .build()
+            .map_err(|e| PointCloudError::ConfigError(
+                format!("创建线程池失败: {}", e)
+            ))?;
+        pool.install(|| {
+            files.into_par_iter()
+                .map(process_one)
+                .collect()
+        })
     } else {
-        files.iter()
-            .map(|f| process_file(f))
+        files.into_iter()
+            .map(process_one)
             .collect()
     };
 
@@ -2118,7 +2140,7 @@ pub fn run_quality_batch(
 
     Ok(BatchQualityResult {
         items,
-        total_files: files.len(),
+        total_files,
         low_quality_count,
         fixed_count,
     })

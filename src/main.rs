@@ -1106,7 +1106,7 @@ fn run_quality_diff(
         print_quality_diff(&diff);
     }
 
-    if !diff.meets_threshold {
+    if !diff.diff.meets_threshold {
         if !as_json {
             eprintln!("修复效果不达标");
         }
