@@ -412,10 +412,11 @@ pub fn assess_overlap(
 
     let avg_spacing = estimate_average_spacing(pc, &kdtree, 6);
     let threshold = avg_spacing * params.overlap_threshold_factor;
-    let threshold_sq = threshold * threshold;
+    let _threshold_sq = threshold * threshold;
 
     let mut visited = vec![false; pc.len()];
     let mut overlap_count = 0usize;
+    let mut points_in_clusters = 0usize;
 
     for i in 0..pc.len() {
         if visited[i] { continue; }
@@ -423,13 +424,18 @@ pub fn assess_overlap(
         let cluster_size = neighbors.len();
         if cluster_size > 1 {
             overlap_count += cluster_size - 1;
+            points_in_clusters += cluster_size;
+            let mut seen = std::collections::HashSet::new();
             for (idx, _) in &neighbors {
-                visited[*idx] = true;
+                if seen.insert(*idx) {
+                    visited[*idx] = true;
+                }
             }
         }
     }
 
-    let overlap_rate = overlap_count as f64 / pc.len() as f64;
+    overlap_count = overlap_count.min(pc.len());
+    let overlap_rate = (overlap_count as f64 / pc.len() as f64).min(1.0);
 
     let score = if overlap_rate <= 0.005 {
         100.0
@@ -714,13 +720,60 @@ pub fn assess_quality(
     let aabb = AABB::from_points(&pc.points).unwrap();
     let bbox_diag = aabb.diagonal();
 
+    let has_normals = pc.has_normals();
+    let do_completeness = params.assess_completeness;
+
+    let effective_weights = if has_normals && do_completeness {
+        *weights
+    } else {
+        let mut w = *weights;
+        let mut redistributed = 0.0f64;
+        let mut active = 0usize;
+
+        if !has_normals {
+            redistributed += w.normal;
+            w.normal = 0.0;
+        } else {
+            active += 1;
+        }
+        if !do_completeness {
+            redistributed += w.completeness;
+            w.completeness = 0.0;
+        } else {
+            active += 1;
+        }
+
+        active += 3;
+        if active > 0 && redistributed > 0.0 {
+            let per_active = redistributed / active as f64;
+            w.density += per_active;
+            w.overlap += per_active;
+            w.noise += per_active;
+            if has_normals { w.normal += per_active; }
+            if do_completeness { w.completeness += per_active; }
+        }
+        w
+    };
+
     log::info!("评估密度均匀性...");
     let density = assess_density_uniformity(pc, params)?;
     log::info!("  得分: {:.1}, CV: {:.4}", density.score, density.cv);
 
-    log::info!("评估法向量一致性...");
-    let normal = assess_normal_consistency(pc, params)?;
-    log::info!("  得分: {:.1}, 翻转率: {:.4}%", normal.score, normal.flip_rate * 100.0);
+    let normal = if has_normals {
+        log::info!("评估法向量一致性...");
+        let res = assess_normal_consistency(pc, params)?;
+        log::info!("  得分: {:.1}, 翻转率: {:.4}%", res.score, res.flip_rate * 100.0);
+        res
+    } else {
+        log::info!("跳过法向量一致性评估(无法向量数据)...");
+        NormalMetricResult {
+            score: 100.0,
+            flip_rate: 0.0,
+            total_pairs: 0,
+            flipped_pairs: 0,
+            mean_angle_deg: 0.0,
+        }
+    };
 
     log::info!("评估重叠区域...");
     let overlap = assess_overlap(pc, params)?;
@@ -730,16 +783,29 @@ pub fn assess_quality(
     let noise = assess_noise_level(pc, params)?;
     log::info!("  得分: {:.1}, 归一化噪声: {:.6}", noise.score, noise.normalized_noise);
 
-    log::info!("评估完整性...");
-    let completeness = assess_completeness(pc, params)?;
-    log::info!("  得分: {:.1}, 大洞数: {}", completeness.score, completeness.large_holes);
+    let completeness = if do_completeness {
+        log::info!("评估完整性...");
+        let res = assess_completeness(pc, params)?;
+        log::info!("  得分: {:.1}, 大洞数: {}", res.score, res.large_holes);
+        res
+    } else {
+        log::info!("跳过完整性评估(未启用)...");
+        CompletenessMetricResult {
+            score: 100.0,
+            hole_count: 0,
+            total_boundary_length: 0.0,
+            large_holes: 0,
+            boundary_threshold: 0.0,
+            assessed: false,
+        }
+    };
 
     let overall_score =
-        density.score * weights.density +
-        normal.score * weights.normal +
-        overlap.score * weights.overlap +
-        noise.score * weights.noise +
-        completeness.score * weights.completeness;
+        density.score * effective_weights.density +
+        normal.score * effective_weights.normal +
+        overlap.score * effective_weights.overlap +
+        noise.score * effective_weights.noise +
+        completeness.score * effective_weights.completeness;
 
     Ok(QualityReport {
         overall_score,
@@ -748,9 +814,9 @@ pub fn assess_quality(
         overlap,
         noise,
         completeness,
-        weights: *weights,
+        weights: effective_weights,
         total_points: pc.len(),
-        has_normals: pc.has_normals(),
+        has_normals,
         bounding_box_diagonal: bbox_diag,
     })
 }
@@ -811,12 +877,21 @@ pub fn print_quality_report(report: &QualityReport) {
     );
 
     let n_color = score_color(report.normal.score);
-    println!("  {:<20} {}{:>6.1}{}  [{:3.0}%]  (翻转率={:.2}%)",
-        "法向量一致性",
-        n_color, report.normal.score, reset,
-        report.weights.normal * 100.0,
-        report.normal.flip_rate * 100.0
-    );
+    if report.weights.normal > 0.0 {
+        println!("  {:<20} {}{:>6.1}{}  [{:3.0}%]  (翻转率={:.2}%)",
+            "法向量一致性",
+            n_color, report.normal.score, reset,
+            report.weights.normal * 100.0,
+            report.normal.flip_rate * 100.0
+        );
+    } else {
+        println!("  {:<20} {:>8}  [{:3.0}%]  (无{}法向量{}跳过)",
+            "法向量一致性",
+            "N/A",
+            0.0,
+            cyan, reset
+        );
+    }
 
     let o_color = score_color(report.overlap.score);
     println!("  {:<20} {}{:>6.1}{}  [{:3.0}%]  (重叠率={:.3}%)",
@@ -835,17 +910,22 @@ pub fn print_quality_report(report: &QualityReport) {
     );
 
     let c_color = score_color(report.completeness.score);
-    let comp_note = if report.completeness.assessed {
-        format!("大洞数={}", report.completeness.large_holes)
+    if report.weights.completeness > 0.0 {
+        let comp_note = format!("大洞数={}", report.completeness.large_holes);
+        println!("  {:<20} {}{:>6.1}{}  [{:3.0}%]  ({})",
+            "完整性评估",
+            c_color, report.completeness.score, reset,
+            report.weights.completeness * 100.0,
+            comp_note
+        );
     } else {
-        "未评估".to_string()
-    };
-    println!("  {:<20} {}{:>6.1}{}  [{:3.0}%]  ({})",
-        "完整性评估",
-        c_color, report.completeness.score, reset,
-        report.weights.completeness * 100.0,
-        comp_note
-    );
+        println!("  {:<20} {:>8}  [{:3.0}%]  (未{}启用{}跳过)",
+            "完整性评估",
+            "N/A",
+            0.0,
+            cyan, reset
+        );
+    }
 
     println!("  {:-<60}", "");
     println!();
@@ -906,21 +986,90 @@ pub fn auto_repair(
     let mut total_added = 0usize;
     let mut total_removed = 0usize;
     let mut normals_fixed = 0usize;
+    let actual_iterations;
 
-    if params.fix_overlap && quality_report.overlap.score < 70.0 {
-        log::info!("修复重叠点...");
-        let result = remove_overlapping_points(&pc, quality_report.overlap.overlap_threshold)?;
-        total_removed += pc.len() - result.points.len();
-        pc = result;
-        log::info!("  去除 {} 个重叠点", total_removed);
+    let initial_bbox = AABB::from_points(&pc.points)
+        .map(|a| a.diagonal())
+        .unwrap_or(1.0);
+
+    let current_overlap_threshold = {
+        let kdtree_tmp = KdTree::from_point_cloud(&pc);
+        let sp = estimate_average_spacing(&pc, &kdtree_tmp, 6);
+        (sp * 0.1).max(1e-8)
+    };
+
+    if params.fix_noise && quality_report.noise.score < 70.0 {
+        log::info!("执行自适应双边滤波去噪...");
+
+        let kdtree = KdTree::from_point_cloud(&pc);
+        let avg_spacing = estimate_average_spacing(&pc, &kdtree, 6);
+
+        let mut sigma_s = if avg_spacing > 0.0 {
+            (avg_spacing * 0.75).min(initial_bbox * 0.005)
+        } else {
+            params.noise_sigma_s
+        };
+        let mut sigma_n = params.noise_sigma_n;
+        sigma_s = sigma_s.max(1e-6);
+
+        let max_iters = if quality_report.noise.score < 30.0 {
+            params.noise_iterations.min(3)
+        } else {
+            params.noise_iterations.min(2)
+        };
+
+        let mut iter_count = 0usize;
+        for iter in 0..max_iters {
+            let prev_bbox = AABB::from_points(&pc.points)
+                .map(|a| a.diagonal())
+                .unwrap_or(initial_bbox);
+
+            let result = bilateral_filter(&pc, sigma_s, sigma_n)?;
+            let new_pc = result;
+
+            let new_bbox = AABB::from_points(&new_pc.points)
+                .map(|a| a.diagonal())
+                .unwrap_or(0.0);
+
+            if new_bbox < prev_bbox * 0.6 {
+                log::warn!("  第 {}/{} 次滤波导致包围盒收缩过多({:.4} -> {:.4}),停止滤波",
+                    iter + 1, max_iters, prev_bbox, new_bbox);
+                break;
+            }
+
+            pc = new_pc;
+            iter_count = iter + 1;
+
+            sigma_n *= 0.85;
+            sigma_s *= 0.9;
+            log::info!("  第 {}/{} 次滤波完成", iter_count, max_iters);
+        }
+        actual_iterations = iter_count;
+
+        if params.fix_overlap {
+            let kdtree_after = KdTree::from_point_cloud(&pc);
+            let sp_after = estimate_average_spacing(&pc, &kdtree_after, 6);
+            let cleanup_thresh = (sp_after * 0.05).max(1e-8);
+            let before = pc.len();
+            let cleaned = remove_overlapping_points(&pc, cleanup_thresh)?;
+            let n_removed = before - cleaned.len();
+            if n_removed > 0 {
+                total_removed += n_removed;
+                pc = cleaned;
+                log::info!("  滤波后清理 {} 个新产生的重叠点", n_removed);
+            }
+        }
+    } else {
+        actual_iterations = 0;
     }
 
-    if params.fix_density && quality_report.density.score < 70.0 {
-        log::info!("修复密度不均匀性...");
-        let result = upsample_sparse_regions(&pc, params.density_target_cv)?;
-        total_added += result.len() - pc.len();
-        pc = PointCloud::from_points(result);
-        log::info!("  添加 {} 个上采样点", total_added);
+    let before_overlap = pc.len();
+    if params.fix_overlap && quality_report.overlap.score < 70.0 {
+        log::info!("修复重叠点...");
+        let result = remove_overlapping_points(&pc, current_overlap_threshold)?;
+        total_removed += before_overlap - result.points.len();
+        pc = result;
+        log::info!("  去除 {} 个重叠点", total_removed);
     }
 
     if params.fix_normals && quality_report.normal.score < 70.0 && pc.has_normals() {
@@ -931,21 +1080,36 @@ pub fn auto_repair(
         log::info!("  修复 {} 个法向量方向", normals_fixed);
     }
 
-    if params.fix_noise && quality_report.noise.score < 70.0 {
-        log::info!("执行自适应双边滤波去噪...");
-        let mut sigma_s = params.noise_sigma_s;
-        let mut sigma_n = params.noise_sigma_n;
+    if params.fix_density && quality_report.density.score < 70.0 {
+        log::info!("修复密度不均匀性...");
+        let target_extra = (total_removed as f64 * 0.6).round() as usize;
+        let result = upsample_sparse_regions(&pc, params.density_target_cv, target_extra)?;
+        let added_now = result.len().saturating_sub(pc.len());
+        total_added += added_now;
+        pc = PointCloud::from_points(result);
+        log::info!("  添加 {} 个上采样点", added_now);
+    }
 
-        if quality_report.overlap.avg_spacing > 0.0 {
-            sigma_s = quality_report.overlap.avg_spacing * 2.0;
+    if params.fix_overlap && (total_added > 0 || actual_iterations > 0) {
+        let kdtree_final = KdTree::from_point_cloud(&pc);
+        let sp_final = estimate_average_spacing(&pc, &kdtree_final, 6);
+        let final_thresh = (sp_final * 0.08).max(1e-8);
+        let before_final = pc.len();
+        let cleaned = remove_overlapping_points(&pc, final_thresh)?;
+        let n_removed = before_final - cleaned.len();
+        if n_removed > 0 {
+            total_removed += n_removed;
+            pc = cleaned;
+            log::info!("  最终清理 {} 个新增重叠点", n_removed);
         }
+    }
 
-        for iter in 0..params.noise_iterations {
-            let result = bilateral_filter(&pc, sigma_s, sigma_n)?;
-            pc = result;
-            sigma_n *= 0.8;
-            log::info!("  第 {}/{} 次滤波完成", iter + 1, params.noise_iterations);
-        }
+    let final_bbox = AABB::from_points(&pc.points)
+        .map(|a| a.diagonal())
+        .unwrap_or(0.0);
+    if final_bbox < initial_bbox * 0.1 && initial_bbox > 1e-6 {
+        log::warn!("修复后包围盒严重收缩({:.4} -> {:.4}),可能存在数据质量问题",
+            initial_bbox, final_bbox);
     }
 
     Ok(RepairResult {
@@ -953,7 +1117,7 @@ pub fn auto_repair(
         points_added: total_added,
         points_removed: total_removed,
         normals_fixed,
-        iterations: params.noise_iterations,
+        iterations: actual_iterations,
     })
 }
 
@@ -1033,7 +1197,7 @@ fn remove_overlapping_points(pc: &PointCloud, threshold: f64) -> Result<PointClo
     Ok(PointCloud::from_points(result))
 }
 
-fn upsample_sparse_regions(pc: &PointCloud, target_cv: f64) -> Result<Vec<Point3D>> {
+fn upsample_sparse_regions(pc: &PointCloud, _target_cv: f64, target_extra_points: usize) -> Result<Vec<Point3D>> {
     if pc.is_empty() {
         return Ok(Vec::new());
     }
@@ -1057,15 +1221,15 @@ fn upsample_sparse_regions(pc: &PointCloud, target_cv: f64) -> Result<Vec<Point3
         let n_points = leaf.point_indices.len();
         if n_points == 0 { continue; }
 
-        let density_ratio = n_points as f64 / mean_pts;
-        if density_ratio >= 0.7 {
+        let density_ratio = n_points as f64 / mean_pts.max(1e-10);
+        if density_ratio >= 0.8 {
             continue;
         }
 
-        let target_points = (mean_pts * 0.8) as usize;
-        let points_to_add = target_points.saturating_sub(n_points);
+        let target_points = (mean_pts * 0.95) as usize;
+        let points_to_add = target_points.saturating_sub(n_points).max(1);
 
-        if points_to_add == 0 || leaf.point_indices.len() < 2 {
+        if leaf.point_indices.len() < 2 {
             continue;
         }
 
@@ -1107,6 +1271,81 @@ fn upsample_sparse_regions(pc: &PointCloud, target_cv: f64) -> Result<Vec<Point3
 
                 new_points.push(mid);
                 added += 1;
+            }
+        }
+    }
+
+    if target_extra_points > 0 {
+        let current_added = new_points.len() - pc.len();
+        let need_more = target_extra_points.saturating_sub(current_added);
+        if need_more > 0 {
+            let mut rng_added = 0usize;
+            let sorted_leaves = {
+                let mut tmp: Vec<(usize, &OctreeNode)> = leaves
+                    .iter()
+                    .map(|l| (l.point_indices.len(), *l))
+                    .filter(|(n, _)| *n >= 2)
+                    .collect();
+                tmp.sort_by(|a, b| a.0.cmp(&b.0));
+                tmp
+            };
+
+            let mut leaf_idx = 0usize;
+            while rng_added < need_more && leaf_idx < sorted_leaves.len() {
+                let (_, leaf) = sorted_leaves[leaf_idx];
+                let indices = &leaf.point_indices;
+                if indices.len() < 2 {
+                    leaf_idx += 1;
+                    continue;
+                }
+
+                let mut added_this_leaf = 0usize;
+                let max_per_leaf = (need_more / sorted_leaves.len().max(1)).max(1).min(50);
+
+                'outer: for i in 0..indices.len() {
+                    for j in i + 1..indices.len() {
+                        if rng_added >= need_more || added_this_leaf >= max_per_leaf {
+                            break 'outer;
+                        }
+                        let pi = &pc[indices[i]];
+                        let pj = &pc[indices[j]];
+                        let t1 = 0.25f64;
+                        let t2 = 0.75f64;
+                        for &t in &[t1, t2] {
+                            if rng_added >= need_more || added_this_leaf >= max_per_leaf {
+                                break 'outer;
+                            }
+                            let interp = Point3D {
+                                position: nalgebra::Point3::new(
+                                    pi.position.x * (1.0 - t) + pj.position.x * t,
+                                    pi.position.y * (1.0 - t) + pj.position.y * t,
+                                    pi.position.z * (1.0 - t) + pj.position.z * t,
+                                ),
+                                color: match (pi.color, pj.color) {
+                                    (Some(c1), Some(c2)) => Some(Color::new(
+                                        (((c1.r as f64) * (1.0 - t) + (c2.r as f64) * t).min(255.0)) as u8,
+                                        (((c1.g as f64) * (1.0 - t) + (c2.g as f64) * t).min(255.0)) as u8,
+                                        (((c1.b as f64) * (1.0 - t) + (c2.b as f64) * t).min(255.0)) as u8,
+                                    )),
+                                    _ => None,
+                                },
+                                normal: match (pi.normal, pj.normal) {
+                                    (Some(n1), Some(n2)) => {
+                                        let n = (n1 * (1.0 - t) + n2 * t).normalize();
+                                        if n.norm() > 1e-15 { Some(n) } else { None }
+                                    },
+                                    _ => None,
+                                },
+                                intensity: None,
+                                curvature: None,
+                            };
+                            new_points.push(interp);
+                            rng_added += 1;
+                            added_this_leaf += 1;
+                        }
+                    }
+                }
+                leaf_idx += 1;
             }
         }
     }
@@ -1182,8 +1421,10 @@ fn bilateral_filter(pc: &PointCloud, sigma_s: f64, sigma_n: f64) -> Result<Point
     }
 
     let kdtree = KdTree::from_point_cloud(pc);
-    let radius = sigma_s * 3.0;
+    let radius = (sigma_s * 2.5).max(1e-6);
     let has_normals = pc.has_normals();
+
+    let self_weight = 3.0f64;
 
     let new_points: Vec<Point3D> = pc
         .points
@@ -1196,7 +1437,6 @@ fn bilateral_filter(pc: &PointCloud, sigma_s: f64, sigma_n: f64) -> Result<Point
             }
 
             let p_normal = p.normal;
-            let n_ref = if let Some(n) = p_normal { n } else { nalgebra::Vector3::z() };
 
             let mut sum_pos = nalgebra::Point3::origin();
             let mut sum_weight = 0.0f64;
@@ -1208,16 +1448,40 @@ fn bilateral_filter(pc: &PointCloud, sigma_s: f64, sigma_n: f64) -> Result<Point
             let mut sum_b = 0.0f64;
             let mut sum_color_weight = 0.0f64;
 
+            sum_pos.coords += p.position.coords * self_weight;
+            sum_weight += self_weight;
+
+            if let Some(n) = p.normal {
+                sum_normal += n * self_weight;
+                sum_normal_weight += self_weight;
+            }
+
+            if let Some(c) = p.color {
+                sum_r += c.r as f64 * self_weight;
+                sum_g += c.g as f64 * self_weight;
+                sum_b += c.b as f64 * self_weight;
+                sum_color_weight += self_weight;
+            } else {
+                has_color = false;
+            }
+
             for (idx, dist) in &neighbors {
+                if *idx == i {
+                    continue;
+                }
                 let np = &pc[*idx];
 
-                let spatial_weight = (-dist * dist / (2.0 * sigma_s * sigma_s)).exp();
+                let spatial_weight = if *dist <= 1e-12 {
+                    1.0
+                } else {
+                    (-dist * dist / (2.0 * sigma_s * sigma_s)).exp()
+                };
 
                 let normal_weight = if has_normals {
                     if let (Some(n_i), Some(n_j)) = (p.normal, np.normal) {
                         let dot = n_i.dot(&n_j).clamp(-1.0, 1.0);
                         let angle_diff = (1.0 - dot).abs();
-                        (-angle_diff * angle_diff / (2.0 * sigma_n * sigma_n)).exp()
+                        (-angle_diff * angle_diff / (2.0 * sigma_n * sigma_n)).exp().max(0.05)
                     } else {
                         1.0
                     }
@@ -1245,7 +1509,7 @@ fn bilateral_filter(pc: &PointCloud, sigma_s: f64, sigma_n: f64) -> Result<Point
                 }
             }
 
-            let mut new_p = if sum_weight > 0.0 {
+            let mut new_p = if sum_weight > 1e-12 {
                 Point3D::new(
                     sum_pos.x / sum_weight,
                     sum_pos.y / sum_weight,
@@ -1255,14 +1519,14 @@ fn bilateral_filter(pc: &PointCloud, sigma_s: f64, sigma_n: f64) -> Result<Point
                 p.clone()
             };
 
-            if has_normals && sum_normal_weight > 0.0 {
+            if has_normals && sum_normal_weight > 1e-12 {
                 let n_len = sum_normal.norm();
                 if n_len > 1e-15 {
                     new_p.normal = Some(sum_normal / n_len);
                 }
             }
 
-            if has_color && sum_color_weight > 0.0 {
+            if has_color && sum_color_weight > 1e-12 {
                 new_p.color = Some(Color::new(
                     (sum_r / sum_color_weight).min(255.0) as u8,
                     (sum_g / sum_color_weight).min(255.0) as u8,
@@ -1270,7 +1534,7 @@ fn bilateral_filter(pc: &PointCloud, sigma_s: f64, sigma_n: f64) -> Result<Point
                 ));
             }
 
-            let _ = n_ref;
+            let _ = p_normal;
             new_p
         })
         .collect();
