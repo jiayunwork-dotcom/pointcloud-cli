@@ -132,6 +132,30 @@ pub enum PipelineStep {
         #[serde(default)]
         diff_with: Option<String>,
     },
+    Align {
+        source: Option<String>,
+        target: Option<String>,
+        #[serde(default)]
+        ransac_iterations: Option<usize>,
+        #[serde(default)]
+        icp_iterations: Option<usize>,
+        #[serde(default)]
+        icp_threshold: Option<f64>,
+        #[serde(default)]
+        voxel_size: Option<f64>,
+        #[serde(default)]
+        normal_radius: Option<f64>,
+        #[serde(default)]
+        fpfh_radius: Option<f64>,
+        #[serde(default)]
+        rmse_warning_threshold: Option<f64>,
+        #[serde(default)]
+        output_transformed_source: Option<String>,
+        #[serde(default)]
+        output_matrix: Option<String>,
+        #[serde(default)]
+        pass_transform_to_next: Option<bool>,
+    },
 }
 
 fn default_filter_type() -> String { "statistical".to_string() }
@@ -165,6 +189,20 @@ pub fn example_config_yaml() -> String {
   - scan2.ply
 
 pipeline:
+  - step: align
+    params:
+      source: source.ply
+      target: target.ply
+      ransac_iterations: 1000
+      icp_iterations: 50
+      icp_threshold: 1e-7
+      voxel_size: 0.0
+      normal_radius: 0.0
+      rmse_warning_threshold: 0.05
+      output_transformed_source: aligned_source.ply
+      output_matrix: transform_matrix.txt
+      pass_transform_to_next: true
+
   - step: filter
     params:
       type: statistical

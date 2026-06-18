@@ -111,6 +111,41 @@ enum Commands {
         #[command(subcommand)]
         action: QualityActions,
     },
+
+    Align {
+        #[arg(help = "源点云文件")]
+        source: PathBuf,
+
+        #[arg(help = "目标点云文件")]
+        target: PathBuf,
+
+        #[arg(long, default_value_t = 1000, help = "RANSAC迭代次数 (默认: 1000)")]
+        ransac_iterations: usize,
+
+        #[arg(long, default_value_t = 50, help = "ICP最大迭代次数 (默认: 50)")]
+        icp_iterations: usize,
+
+        #[arg(long, default_value_t = 1e-7, help = "ICP收敛阈值 (默认: 1e-7)")]
+        icp_threshold: f64,
+
+        #[arg(long, default_value_t = 0.0, help = "下采样体素大小 (默认: 0, 不下采样)")]
+        voxel_size: f64,
+
+        #[arg(long, default_value_t = 0.0, help = "法向量估计半径 (默认: 0, 自动=平均点间距*3)")]
+        normal_radius: f64,
+
+        #[arg(long, help = "FPFH特征计算半径 (默认: 自动=平均点间距*10)")]
+        fpfh_radius: Option<f64>,
+
+        #[arg(long, help = "以JSON格式输出精度报告")]
+        json: bool,
+
+        #[arg(long, help = "将4x4变换矩阵保存到文本文件")]
+        output_matrix: Option<PathBuf>,
+
+        #[arg(long, help = "将变换应用到源点云并保存到指定文件")]
+        apply: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -266,6 +301,8 @@ fn main() {
         Commands::Benchmark { input } => run_benchmark(&input),
         Commands::Quality { action }
             => run_quality(action),
+        Commands::Align { source, target, ransac_iterations, icp_iterations, icp_threshold, voxel_size, normal_radius, fpfh_radius, json, output_matrix, apply }
+            => do_align(&source, &target, ransac_iterations, icp_iterations, icp_threshold, voxel_size, normal_radius, fpfh_radius, json, output_matrix.as_deref(), apply.as_deref()),
     };
 
     if let Err(e) = result {
@@ -1141,6 +1178,286 @@ fn run_quality_batch(
         println!("{}", json);
     } else {
         print_batch_summary(&result);
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct FullAlignmentReport {
+    source_file: String,
+    target_file: String,
+    source_points: usize,
+    target_points: usize,
+    registration: AlignmentRegistrationInfo,
+    accuracy: registration::AlignmentAccuracyReport,
+    transform_matrix: [[f64; 4]; 4],
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct AlignmentRegistrationInfo {
+    ransac_iterations: usize,
+    icp_iterations: usize,
+    icp_converged: bool,
+    coarse_inlier_count: usize,
+    voxel_size: f64,
+    elapsed_ms: u64,
+}
+
+fn colorize_rmse(rmse: f64, threshold: f64) -> String {
+    let color = if rmse <= threshold * 0.5 {
+        "\x1b[32m"
+    } else if rmse <= threshold {
+        "\x1b[33m"
+    } else {
+        "\x1b[31m"
+    };
+    format!("{}{:.6}{}", color, rmse, "\x1b[0m")
+}
+
+fn colorize_ratio(ratio: f64, good_thresh: f64, ok_thresh: f64) -> String {
+    let pct = ratio * 100.0;
+    let color = if ratio >= good_thresh {
+        "\x1b[32m"
+    } else if ratio >= ok_thresh {
+        "\x1b[33m"
+    } else {
+        "\x1b[31m"
+    };
+    format!("{}{:.1}%{}", color, pct, "\x1b[0m")
+}
+
+fn print_colored_alignment_report(
+    source_path: &Path,
+    target_path: &Path,
+    reg_result: &registration::RegistrationResult,
+    accuracy: &registration::AlignmentAccuracyReport,
+    elapsed: std::time::Duration,
+) {
+    let avg_spacing = accuracy.inlier_threshold / 3.0;
+
+    println!();
+    println!("{}", "\x1b[1m╔══════════════════════════════════════════════════════════════╗\x1b[0m");
+    println!("{}", "\x1b[1m║              点云对齐与配准精度验证报告                       ║\x1b[0m");
+    println!("{}", "\x1b[1m╚══════════════════════════════════════════════════════════════╝\x1b[0m");
+    println!();
+
+    println!("{}", "\x1b[1m━━━ 输入信息 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
+    println!("  源点云:     {}", source_path.display());
+    println!("  目标点云:   {}", target_path.display());
+    println!("  源点数:     {} 点", accuracy.source_points);
+    println!("  目标点数:   {} 点", accuracy.target_points);
+    println!("  平均点间距: {:.6}", avg_spacing);
+    println!();
+
+    println!("{}", "\x1b[1m━━━ 配准过程 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
+    println!("  RANSAC迭代:   {} 次", reg_result.iterations);
+    println!("  ICP迭代:      {} 次", reg_result.iterations);
+    println!("  ICP收敛:      {}", if reg_result.converged { "\x1b[32m✓ 是\x1b[0m" } else { "\x1b[31m✗ 否\x1b[0m" });
+    println!("  粗配准内点:   {} 点", reg_result.coarse_inlier_count);
+    println!("  总耗时:       {:.2}s", elapsed.as_secs_f64());
+    println!();
+
+    println!("{}", "\x1b[1m━━━ 精度指标 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
+
+    let rmse_colored = colorize_rmse(accuracy.rmse, avg_spacing);
+    let inlier_colored = colorize_ratio(accuracy.inlier_ratio, 0.7, 0.4);
+    let overlap_colored = colorize_ratio(accuracy.overlap_rate, 0.7, 0.4);
+
+    println!("  RMSE(均方根误差):  {}", rmse_colored);
+    println!("  最大误差:          {:.6}", accuracy.max_error);
+    println!("  平均距离:          {:.6}", accuracy.mean_distance);
+    println!("  中位数距离:        {:.6}", accuracy.median_distance);
+    println!("  内点比例:          {}  (阈值: 平均点间距×3 = {:.6})", inlier_colored, accuracy.inlier_threshold);
+    println!("  重叠率:            {}  (源点云与目标点云有对应点的比例)", overlap_colored);
+    println!("  对应点对总数:      {} 对", accuracy.corresponding_pairs);
+    println!();
+
+    println!("{}", "\x1b[1m━━━ 变换度量 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
+    println!("  总旋转角度:  {:.4}°", accuracy.rotation_angle_deg);
+    println!("  平移距离:    {:.6}", accuracy.translation_distance);
+    println!();
+
+    println!("{}", "\x1b[1m━━━ 4×4 变换矩阵 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
+    let tfmt = |v: f64| -> String {
+        if v >= 0.0 {
+            format!(" {:.6e}", v)
+        } else {
+            format!("{:.6e}", v)
+        }
+    };
+    println!("  ⎛ {}  {}  {}  {} ⎞",
+        tfmt(reg_result.transform[(0, 0)]), tfmt(reg_result.transform[(0, 1)]),
+        tfmt(reg_result.transform[(0, 2)]), tfmt(reg_result.transform[(0, 3)]));
+    println!("  ⎜ {}  {}  {}  {} ⎟",
+        tfmt(reg_result.transform[(1, 0)]), tfmt(reg_result.transform[(1, 1)]),
+        tfmt(reg_result.transform[(1, 2)]), tfmt(reg_result.transform[(1, 3)]));
+    println!("  ⎜ {}  {}  {}  {} ⎟",
+        tfmt(reg_result.transform[(2, 0)]), tfmt(reg_result.transform[(2, 1)]),
+        tfmt(reg_result.transform[(2, 2)]), tfmt(reg_result.transform[(2, 3)]));
+    println!("  ⎝ {}  {}  {}  {} ⎠",
+        tfmt(reg_result.transform[(3, 0)]), tfmt(reg_result.transform[(3, 1)]),
+        tfmt(reg_result.transform[(3, 2)]), tfmt(reg_result.transform[(3, 3)]));
+    println!();
+
+    println!("{}", "\x1b[1m━━━ 质量分级 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
+    let (grade, grade_color, comment) = {
+        let rmse_ok = accuracy.rmse <= avg_spacing;
+        let inlier_ok = accuracy.inlier_ratio >= 0.5;
+        let overlap_ok = accuracy.overlap_rate >= 0.5;
+
+        if rmse_ok && inlier_ok && overlap_ok {
+            ("优秀", "\x1b[32m", "配准质量优秀，可直接使用")
+        } else if (rmse_ok || inlier_ok) && overlap_ok {
+            ("良好", "\x1b[32m", "配准质量良好，可用于大多数场景")
+        } else if overlap_ok {
+            ("一般", "\x1b[33m", "配准质量一般，建议检查参数或调整初始位置")
+        } else {
+            ("较差", "\x1b[31m", "配准质量较差，建议调整参数或手动提供初始变换")
+        }
+    };
+    println!("  综合评级: {}{}{}", grade_color, grade, "\x1b[0m");
+    println!("  说明:     {}", comment);
+    println!();
+
+    println!("{}", "\x1b[1m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
+    println!("  {}=优秀  {}=良好/一般  {}=较差", "\x1b[32m绿色\x1b[0m", "\x1b[33m黄色\x1b[0m", "\x1b[31m红色\x1b[0m");
+    println!();
+}
+
+fn do_align(
+    source_path: &Path,
+    target_path: &Path,
+    ransac_iterations: usize,
+    icp_iterations: usize,
+    icp_threshold: f64,
+    voxel_size: f64,
+    normal_radius: f64,
+    fpfh_radius: Option<f64>,
+    as_json: bool,
+    output_matrix: Option<&Path>,
+    apply_output: Option<&Path>,
+) -> Result<()> {
+    let total_start = std::time::Instant::now();
+
+    let reader = io::PointCloudReader::new();
+
+    log::info!("加载源点云: {}", source_path.display());
+    let source = reader.read(source_path)?;
+    log::info!("  源点数: {}", source.len());
+
+    log::info!("加载目标点云: {}", target_path.display());
+    let target = reader.read(target_path)?;
+    log::info!("  目标点数: {}", target.len());
+
+    let mut params = registration::RegistrationParams {
+        fpfh_radius: fpfh_radius.unwrap_or(0.0),
+        ransac_max_iterations: ransac_iterations,
+        ransac_inlier_threshold_factor: 2.0,
+        icp_max_iterations: icp_iterations,
+        icp_convergence_threshold: icp_threshold,
+        icp_max_correspondence_distance: 1.0,
+        voxel_size,
+        normal_radius,
+    };
+
+    if fpfh_radius.is_none() {
+        params.fpfh_radius = 0.0;
+    }
+
+    if voxel_size > 0.0 {
+        log::info!("将使用体素下采样 (大小={})", voxel_size);
+    }
+
+    log::info!("开始配准流程 (RANSAC={}, ICP={}, ICP阈值={:e})...",
+        ransac_iterations, icp_iterations, icp_threshold);
+
+    let reg_result = registration::register_point_clouds(&source, &target, &params)?;
+    log::info!("配准完成: RMSE={:.6}, 收敛={}, 迭代={}",
+        reg_result.rmse, reg_result.converged, reg_result.iterations);
+
+    log::info!("计算对齐精度报告...");
+    let accuracy = registration::evaluate_alignment(&source, &target, &reg_result.transform);
+
+    let elapsed = total_start.elapsed();
+
+    let mut t_flat = [[0.0f64; 4]; 4];
+    for r in 0..4 {
+        for c in 0..4 {
+            t_flat[r][c] = reg_result.transform[(r, c)];
+        }
+    }
+
+    if as_json {
+        let report = FullAlignmentReport {
+            source_file: source_path.to_string_lossy().to_string(),
+            target_file: target_path.to_string_lossy().to_string(),
+            source_points: accuracy.source_points,
+            target_points: accuracy.target_points,
+            registration: AlignmentRegistrationInfo {
+                ransac_iterations,
+                icp_iterations: reg_result.iterations,
+                icp_converged: reg_result.converged,
+                coarse_inlier_count: reg_result.coarse_inlier_count,
+                voxel_size,
+                elapsed_ms: crate::report::duration_to_ms(elapsed),
+            },
+            accuracy: accuracy.clone(),
+            transform_matrix: t_flat,
+        };
+        let json = serde_json::to_string_pretty(&report)
+            .map_err(|e| PointCloudError::JsonError(e))?;
+        println!("{}", json);
+    } else {
+        print_colored_alignment_report(
+            source_path, target_path, &reg_result, &accuracy, elapsed
+        );
+    }
+
+    if let Some(mat_path) = output_matrix {
+        if let Some(parent) = mat_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).ok();
+            }
+        }
+        registration::save_transform_matrix(&reg_result.transform, mat_path)?;
+        if !as_json {
+            println!("变换矩阵已保存到: {}", mat_path.display());
+        } else {
+            log::info!("变换矩阵已保存到: {}", mat_path.display());
+        }
+    }
+
+    if let Some(apply_path) = apply_output {
+        if let Some(parent) = apply_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).ok();
+            }
+        }
+        let mut transformed = source.clone();
+        transformed.apply_transform(&reg_result.transform);
+
+        let ext = apply_path.extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("ply")
+            .to_lowercase();
+
+        match ext.as_str() {
+            "ply" => {
+                io::write_point_cloud_ply(&transformed, apply_path)?;
+            }
+            _ => {
+                return Err(PointCloudError::UnsupportedFormat(
+                    format!("不支持的输出格式: .{} (仅支持.ply用于变换后点云输出)", ext)
+                ));
+            }
+        }
+
+        if !as_json {
+            println!("变换后源点云已保存到: {}", apply_path.display());
+        } else {
+            log::info!("变换后源点云已保存到: {}", apply_path.display());
+        }
     }
 
     Ok(())

@@ -824,6 +824,113 @@ impl PipelineEngine {
                         write_point_cloud_ply(&point_cloud, &out).ok();
                     }
                 }
+
+                PipelineStep::Align { source, target, ransac_iterations, icp_iterations, icp_threshold, voxel_size, normal_radius, fpfh_radius, rmse_warning_threshold, output_transformed_source, output_matrix, pass_transform_to_next } => {
+                    let step_start = Instant::now();
+
+                    let source_path = source.clone().unwrap_or_else(|| input_path.to_string_lossy().to_string());
+                    let target_path = target.clone().ok_or_else(|| {
+                        PointCloudError::ConfigError("Align步骤需要指定target参数".to_string())
+                    })?;
+
+                    log::info!("  加载源点云: {}", source_path);
+                    let align_source = self.reader.read(Path::new(&source_path))?;
+                    log::info!("  加载目标点云: {}", target_path);
+                    let align_target = self.reader.read(Path::new(&target_path))?;
+
+                    let mut reg_params = RegistrationParams::default();
+                    reg_params.ransac_max_iterations = ransac_iterations.unwrap_or(1000);
+                    reg_params.icp_max_iterations = icp_iterations.unwrap_or(50);
+                    reg_params.icp_convergence_threshold = icp_threshold.unwrap_or(1e-7);
+                    reg_params.voxel_size = voxel_size.unwrap_or(0.0);
+                    reg_params.normal_radius = normal_radius.unwrap_or(0.0);
+                    if let Some(r) = fpfh_radius { reg_params.fpfh_radius = *r; }
+
+                    log::info!("  执行配准 (源: {}点, 目标: {}点)...",
+                        align_source.len(), align_target.len());
+                    let reg_result = register_point_clouds(&align_source, &align_target, &reg_params)?;
+
+                    let accuracy = evaluate_alignment(&align_source, &align_target, &reg_result.transform);
+                    log::info!("  配准完成: RMSE={:.6}, 内点比例={:.1}%, 重叠率={:.1}%",
+                        accuracy.rmse,
+                        accuracy.inlier_ratio * 100.0,
+                        accuracy.overlap_rate * 100.0
+                    );
+
+                    let rmse_warn = rmse_warning_threshold.unwrap_or(f64::INFINITY);
+                    if accuracy.rmse > rmse_warn {
+                        log::warn!("  ⚠ RMSE({:.6}) 超过阈值 ({:.6})", accuracy.rmse, rmse_warn);
+                        file_report.success = false;
+                        let existing_err = file_report.error_message.take().unwrap_or_default();
+                        let prefix = if existing_err.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{}; ", existing_err)
+                        };
+                        file_report.error_message = Some(format!(
+                            "{}配准RMSE超限: {:.6} > {:.6}",
+                            prefix, accuracy.rmse, rmse_warn
+                        ));
+                    }
+
+                    let mut t_flat = [[0.0f64; 4]; 4];
+                    for r in 0..4 {
+                        for c in 0..4 {
+                            t_flat[r][c] = reg_result.transform[(r, c)];
+                        }
+                    }
+
+                    file_report.registration_stats = Some(RegistrationStats {
+                        register_type: "fpfh_ransac_icp".to_string(),
+                        rmse: accuracy.rmse,
+                        iterations: reg_result.iterations,
+                        converged: reg_result.converged,
+                        transform_matrix: t_flat,
+                        time_ms: duration_to_ms(step_start.elapsed()),
+                    });
+
+                    if let Some(ref out_path) = output_matrix {
+                        let resolved = if Path::new(out_path).is_absolute() {
+                            PathBuf::from(out_path)
+                        } else {
+                            output_dir.join(out_path)
+                        };
+                        if let Some(parent) = resolved.parent() {
+                            std::fs::create_dir_all(parent).ok();
+                        }
+                        save_transform_matrix(&reg_result.transform, &resolved).ok();
+                        log::info!("  变换矩阵已保存: {}", resolved.display());
+                    }
+
+                    if let Some(ref out_path) = output_transformed_source {
+                        let resolved = if Path::new(out_path).is_absolute() {
+                            PathBuf::from(out_path)
+                        } else {
+                            output_dir.join(out_path)
+                        };
+                        let mut transformed_src = align_source.clone();
+                        transformed_src.apply_transform(&reg_result.transform);
+                        if let Some(parent) = resolved.parent() {
+                            std::fs::create_dir_all(parent).ok();
+                        }
+                        write_point_cloud_ply(&transformed_src, &resolved).ok();
+                        log::info!("  变换后源点云已保存: {}", resolved.display());
+                    }
+
+                    if pass_transform_to_next.unwrap_or(false) {
+                        log::info!("  将变换应用到当前处理的点云");
+                        point_cloud.apply_transform(&reg_result.transform);
+                    }
+
+                    if output_intermediate {
+                        let out = output_dir.join(format!("{}_step{}_aligned.ply", stem, step_idx));
+                        let mut pc_copy = point_cloud.clone();
+                        if !pass_transform_to_next.unwrap_or(false) {
+                            pc_copy.apply_transform(&reg_result.transform);
+                        }
+                        write_point_cloud_ply(&pc_copy, &out).ok();
+                    }
+                }
             }
         }
 
@@ -889,6 +996,7 @@ fn step_name(step: &PipelineStep) -> String {
         PipelineStep::Smooth { .. } => "Smooth".to_string(),
         PipelineStep::Segment { .. } => "Segment".to_string(),
         PipelineStep::Quality { .. } => "Quality".to_string(),
+        PipelineStep::Align { .. } => "Align".to_string(),
     }
 }
 
@@ -1031,6 +1139,18 @@ fn describe_step(step: &PipelineStep) -> String {
             if octree_depth.is_some() { desc.push_str(&format!(", octree_depth={}", octree_depth.unwrap())); }
             if noise_k.is_some() { desc.push_str(&format!(", noise_k={}", noise_k.unwrap())); }
             if diff_with.is_some() { desc.push_str(", 对比模式"); }
+            desc.push_str(")");
+            desc
+        }
+        PipelineStep::Align { source, target, ransac_iterations, icp_iterations, icp_threshold, voxel_size, normal_radius, fpfh_radius, rmse_warning_threshold, output_transformed_source, output_matrix, pass_transform_to_next } => {
+            let mut desc = format!("Align (");
+            if let Some(s) = source { desc.push_str(&format!("源: {}, ", s)); }
+            if let Some(t) = target { desc.push_str(&format!("目标: {}", t)); }
+            desc.push_str(&format!(", RANSAC迭代={}", ransac_iterations.unwrap_or(1000)));
+            desc.push_str(&format!(", ICP迭代={}", icp_iterations.unwrap_or(50)));
+            if let Some(v) = voxel_size { if *v > 0.0 { desc.push_str(&format!(", voxel={}", v)); } }
+            if let Some(t) = rmse_warning_threshold { desc.push_str(&format!(", RMSE阈值={}", t)); }
+            if pass_transform_to_next.unwrap_or(false) { desc.push_str(", 传递变换"); }
             desc.push_str(")");
             desc
         }
