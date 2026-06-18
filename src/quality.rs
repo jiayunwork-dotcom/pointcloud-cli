@@ -984,6 +984,7 @@ pub fn auto_repair(
 ) -> Result<RepairResult> {
     let mut pc = pc.clone();
     let initial_count = pc.len();
+    let original_pc = pc.clone();
     let mut total_added = 0usize;
     let mut total_removed = 0usize;
     let mut normals_fixed = 0usize;
@@ -992,6 +993,9 @@ pub fn auto_repair(
     let initial_bbox = AABB::from_points(&pc.points)
         .map(|a| a.diagonal())
         .unwrap_or(1.0);
+
+    let net_removed_limit = (initial_count as f64 * 0.20).floor() as usize;
+    fn net_cur(removed: usize, added: usize) -> usize { removed.saturating_sub(added) }
 
     let base_kdtree = KdTree::from_point_cloud(&pc);
     let base_avg_spacing = estimate_average_spacing(&pc, &base_kdtree, 6);
@@ -1042,7 +1046,7 @@ pub fn auto_repair(
             pc = new_pc;
             iter_count = iter + 1;
 
-            if params.fix_overlap && iter_count < max_iters {
+            if params.fix_overlap && iter_count < max_iters && net_cur(total_removed, total_added) < net_removed_limit {
                 let cur_kdtree = KdTree::from_point_cloud(&pc);
                 let cur_spacing = estimate_average_spacing(&pc, &cur_kdtree, 6);
                 let cleanup_thresh = (cur_spacing * params.overlap_threshold_factor * 0.9).max(1e-8);
@@ -1050,10 +1054,14 @@ pub fn auto_repair(
                 let cleaned = remove_overlapping_points(&pc, cleanup_thresh)?;
                 let n_removed = before - cleaned.len();
                 if n_removed > 0 {
-                    total_removed += n_removed;
-                    pc = cleaned;
-                    log::info!("  第 {}/{} 次滤波后清理 {} 个重叠点",
-                        iter_count, max_iters, n_removed);
+                    if net_cur(total_removed, total_added) + n_removed > net_removed_limit {
+                        log::warn!("  重叠清理将超过数据量安全限制,跳过本次清理");
+                    } else {
+                        total_removed += n_removed;
+                        pc = cleaned;
+                        log::info!("  第 {}/{} 次滤波后清理 {} 个重叠点",
+                            iter_count, max_iters, n_removed);
+                    }
                 }
             }
 
@@ -1073,7 +1081,7 @@ pub fn auto_repair(
         log::info!("  修复 {} 个法向量方向", normals_fixed);
     }
 
-    if params.fix_overlap && quality_report.overlap.score < 70.0 {
+    if params.fix_overlap && quality_report.overlap.score < 70.0 && net_cur(total_removed, total_added) < net_removed_limit {
         log::info!("修复重叠点...");
         let cur_kdtree = KdTree::from_point_cloud(&pc);
         let cur_spacing = estimate_average_spacing(&pc, &cur_kdtree, 6);
@@ -1082,15 +1090,28 @@ pub fn auto_repair(
         let before = pc.len();
         let result = remove_overlapping_points(&pc, overlap_thresh)?;
         let removed_now = before - result.len();
-        total_removed += removed_now;
-        pc = result;
-        log::info!("  去除 {} 个重叠点", removed_now);
+
+        let allowed = net_removed_limit.saturating_sub(net_cur(total_removed, total_added));
+        if removed_now <= allowed {
+            total_removed += removed_now;
+            pc = result;
+            log::info!("  去除 {} 个重叠点", removed_now);
+        } else {
+            log::warn!("  重叠去除({}点)将超过数据量安全限制(剩余额度{}点),执行受限清理",
+                removed_now, allowed);
+
+            let partial_pc = partial_overlap_removal(&pc, overlap_thresh, allowed)?;
+            let actually_removed = before - partial_pc.len();
+            total_removed += actually_removed;
+            pc = partial_pc;
+            log::info!("  受限去除 {} 个重叠点", actually_removed);
+        }
     }
 
     let removed_so_far = total_removed;
     if params.fix_density && quality_report.density.score < 70.0 {
         log::info!("修复密度不均匀性...");
-        let target_extra = (removed_so_far as f64 * 0.9).round() as usize;
+        let target_extra = (removed_so_far as f64 * 1.1).round() as usize;
         let result = upsample_sparse_regions(&pc, params.density_target_cv, target_extra)?;
         let added_now = result.len().saturating_sub(pc.len());
         total_added += added_now;
@@ -1098,27 +1119,55 @@ pub fn auto_repair(
         log::info!("  添加 {} 个上采样点", added_now);
     }
 
-    if params.fix_overlap && (total_added > 0 || actual_iterations > 0) {
+    if params.fix_overlap && (total_added > 0 || actual_iterations > 0)
+        && net_cur(total_removed, total_added) < net_removed_limit
+    {
         let cur_kdtree = KdTree::from_point_cloud(&pc);
         let cur_spacing = estimate_average_spacing(&pc, &cur_kdtree, 6);
         let final_thresh = (cur_spacing * params.overlap_threshold_factor).max(1e-8);
         let before_final = pc.len();
         let cleaned = remove_overlapping_points(&pc, final_thresh)?;
         let n_removed = before_final - cleaned.len();
-        if n_removed > 0 {
-            total_removed += n_removed;
-            pc = cleaned;
-            log::info!("  最终清理 {} 个新增重叠点", n_removed);
+
+        let allowed = net_removed_limit.saturating_sub(net_cur(total_removed, total_added));
+        if n_removed <= allowed {
+            if n_removed > 0 {
+                total_removed += n_removed;
+                pc = cleaned;
+                log::info!("  最终清理 {} 个新增重叠点", n_removed);
+            }
+        } else {
+            log::warn!("  最终重叠清理({}点)超限,执行受限清理(额度{}点)", n_removed, allowed);
+            let partial_pc = partial_overlap_removal(&pc, final_thresh, allowed)?;
+            let actually_removed = before_final - partial_pc.len();
+            if actually_removed > 0 {
+                total_removed += actually_removed;
+                pc = partial_pc;
+                log::info!("  受限清理 {} 个新增重叠点", actually_removed);
+            }
         }
     }
 
     let final_count = pc.len();
-    let max_allowed_removed = (initial_count as f64 * 0.15).floor() as usize;
     let net_removed = total_removed.saturating_sub(total_added);
+    let net_ratio = if initial_count > 0 {
+        net_removed as f64 / initial_count as f64
+    } else {
+        0.0
+    };
 
-    if net_removed > max_allowed_removed && initial_count > 0 {
-        let ratio = final_count as f64 / initial_count as f64;
-        log::warn!("修复后点数减少过多({:.1}%),已达到安全限制", (1.0 - ratio) * 100.0);
+    if net_ratio > 0.25 && initial_count > 0 {
+        log::error!("修复后净点数减少过多({:.1}%),超出安全阈值,回滚到原始点云",
+            net_ratio * 100.0);
+        return Ok(RepairResult {
+            point_cloud: original_pc,
+            points_added: 0,
+            points_removed: 0,
+            normals_fixed: 0,
+            iterations: 0,
+        });
+    } else if net_ratio > 0.15 {
+        log::warn!("修复后净点数减少 {:.1}%,请确认修复效果是否可接受", net_ratio * 100.0);
     }
 
     let final_bbox = AABB::from_points(&pc.points)
@@ -1136,6 +1185,53 @@ pub fn auto_repair(
         normals_fixed,
         iterations: actual_iterations,
     })
+}
+
+fn partial_overlap_removal(
+    pc: &PointCloud,
+    threshold: f64,
+    max_remove: usize,
+) -> Result<PointCloud> {
+    if pc.is_empty() {
+        return Ok(PointCloud::new());
+    }
+    if max_remove == 0 {
+        return Ok(pc.clone());
+    }
+
+    let kdtree = KdTree::from_point_cloud(pc);
+    let mut removed = vec![false; pc.len()];
+    let mut remove_count = 0usize;
+
+    for i in 0..pc.len() {
+        if removed[i] { continue; }
+
+        let neighbors = kdtree.radius_search(&pc[i].position, threshold);
+
+        for (idx, _) in &neighbors {
+            if *idx != i && !removed[*idx] {
+                if remove_count >= max_remove {
+                    break;
+                }
+                removed[*idx] = true;
+                remove_count += 1;
+            }
+        }
+
+        if remove_count >= max_remove {
+            break;
+        }
+    }
+
+    let keep_count = pc.len() - remove_count;
+    let mut result = Vec::with_capacity(keep_count);
+    for i in 0..pc.len() {
+        if !removed[i] {
+            result.push(pc[i].clone());
+        }
+    }
+
+    Ok(PointCloud::from_points(result))
 }
 
 fn remove_overlapping_points(pc: &PointCloud, threshold: f64) -> Result<PointCloud> {
@@ -1351,6 +1447,14 @@ fn fix_normal_orientations(pc: &PointCloud) -> Result<NormalFixResult> {
             continue;
         }
 
+        let seed_nz = result[start].normal.map(|n| n.z).unwrap_or(1.0);
+        if seed_nz < 0.0 {
+            if let Some(n) = result[start].normal {
+                result[start].normal = Some(-n);
+                flipped_count += 1;
+            }
+        }
+
         let mut queue = VecDeque::new();
         queue.push_back(start);
         visited[start] = true;
@@ -1371,7 +1475,8 @@ fn fix_normal_orientations(pc: &PointCloud) -> Result<NormalFixResult> {
                 visited[nidx] = true;
 
                 if let Some(neighbor_normal) = result[nidx].normal {
-                    if current_normal.dot(&neighbor_normal) < 0.0 {
+                    let dot = current_normal.dot(&neighbor_normal);
+                    if dot < 0.0 {
                         result[nidx].normal = Some(-neighbor_normal);
                         flipped_count += 1;
                     }
@@ -1382,10 +1487,65 @@ fn fix_normal_orientations(pc: &PointCloud) -> Result<NormalFixResult> {
         }
     }
 
+    let post_flip = assess_flip_rate_post(&result, &kdtree, k.min(8));
+    let pre_flip = assess_flip_rate_pre(pc, &kdtree, k.min(8));
+
+    if post_flip > pre_flip * 1.15 {
+        log::warn!("法向量修复后翻转率恶化({:.2}% -> {:.2}%),回滚到原始法向量",
+            pre_flip * 100.0, post_flip * 100.0);
+        let revert_result = pc.points.clone();
+        return Ok(NormalFixResult {
+            point_cloud: PointCloud::from_points(revert_result),
+            flipped_count: 0,
+        });
+    }
+
     Ok(NormalFixResult {
         point_cloud: PointCloud::from_points(result),
         flipped_count,
     })
+}
+
+fn assess_flip_rate_pre(pc: &PointCloud, kdtree: &KdTree, k: usize) -> f64 {
+    let sample = pc.len().min(500);
+    let step = (pc.len() / sample.max(1)).max(1);
+    let mut total_pairs = 0usize;
+    let mut flipped_pairs = 0usize;
+
+    for i in (0..pc.len()).step_by(step).take(sample) {
+        let Some(n_i) = pc[i].normal else { continue };
+        let neighbors = kdtree.knn(&pc[i].position, k + 1);
+        for (nidx, _) in neighbors.iter().skip(1) {
+            let Some(n_j) = pc[*nidx].normal else { continue };
+            total_pairs += 1;
+            if n_i.dot(&n_j) < 0.0 {
+                flipped_pairs += 1;
+            }
+        }
+    }
+
+    if total_pairs == 0 { 0.0 } else { flipped_pairs as f64 / total_pairs as f64 }
+}
+
+fn assess_flip_rate_post(points: &[Point3D], kdtree: &KdTree, k: usize) -> f64 {
+    let sample = points.len().min(500);
+    let step = (points.len() / sample.max(1)).max(1);
+    let mut total_pairs = 0usize;
+    let mut flipped_pairs = 0usize;
+
+    for i in (0..points.len()).step_by(step).take(sample) {
+        let Some(n_i) = points[i].normal else { continue };
+        let neighbors = kdtree.knn(&points[i].position, k + 1);
+        for (nidx, _) in neighbors.iter().skip(1) {
+            let Some(n_j) = points[*nidx].normal else { continue };
+            total_pairs += 1;
+            if n_i.dot(&n_j) < 0.0 {
+                flipped_pairs += 1;
+            }
+        }
+    }
+
+    if total_pairs == 0 { 0.0 } else { flipped_pairs as f64 / total_pairs as f64 }
 }
 
 fn bilateral_filter(pc: &PointCloud, sigma_s: f64, sigma_n: f64) -> Result<PointCloud> {
@@ -1396,6 +1556,8 @@ fn bilateral_filter(pc: &PointCloud, sigma_s: f64, sigma_n: f64) -> Result<Point
     let kdtree = KdTree::from_point_cloud(pc);
     let radius = (sigma_s * 3.0).max(1e-6);
     let has_normals = pc.has_normals();
+    let two_ss = 2.0 * sigma_s * sigma_s;
+    let two_nn = 2.0 * sigma_n * sigma_n;
 
     let new_points: Vec<Point3D> = pc
         .points
@@ -1403,11 +1565,45 @@ fn bilateral_filter(pc: &PointCloud, sigma_s: f64, sigma_n: f64) -> Result<Point
         .enumerate()
         .map(|(i, p)| {
             let neighbors = kdtree.radius_search(&p.position, radius);
-            if neighbors.len() <= 1 {
+            if neighbors.len() < 4 {
                 return p.clone();
             }
 
             let p_normal = p.normal;
+
+            let neighbor_points: Vec<nalgebra::Point3<f64>> = neighbors
+                .iter()
+                .map(|(idx, _)| pc[*idx].position)
+                .collect();
+
+            let n = neighbor_points.len() as f64;
+            let mut centroid = nalgebra::Point3::origin();
+            for np in &neighbor_points {
+                centroid.coords += np.coords;
+            }
+            centroid.coords /= n;
+
+            let mut cov = nalgebra::Matrix3::zeros();
+            for np in &neighbor_points {
+                let d = np.coords - centroid.coords;
+                cov += d * d.transpose();
+            }
+
+            let eigen = nalgebra::SymmetricEigen::new(cov);
+            let mut eig_pairs: Vec<(f64, nalgebra::Vector3<f64>)> = eigen
+                .eigenvalues
+                .iter()
+                .zip(eigen.eigenvectors.column_iter())
+                .map(|(v, col)| (*v, col.clone_owned()))
+                .collect();
+            eig_pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+            let plane_normal = eig_pairs[0].1.normalize();
+            let plane_d = -plane_normal.dot(&centroid.coords);
+            let dist_to_plane = (plane_normal.dot(&p.position.coords) + plane_d).abs();
+
+            let projected = p.position.coords - dist_to_plane * plane_normal
+                * (plane_normal.dot(&p.position.coords) + plane_d).signum();
 
             let mut sum_pos = nalgebra::Point3::origin();
             let mut sum_weight = 0.0f64;
@@ -1421,18 +1617,21 @@ fn bilateral_filter(pc: &PointCloud, sigma_s: f64, sigma_n: f64) -> Result<Point
 
             for (idx, dist) in &neighbors {
                 let np = &pc[*idx];
+                let np_dist_to_plane = (plane_normal.dot(&np.position.coords) + plane_d).abs();
+                let np_projected = np.position.coords - np_dist_to_plane * plane_normal
+                    * (plane_normal.dot(&np.position.coords) + plane_d).signum();
 
                 let spatial_weight = if *dist <= 1e-12 {
                     1.0
                 } else {
-                    (-dist * dist / (2.0 * sigma_s * sigma_s)).exp()
+                    (-dist * dist / two_ss).exp()
                 };
 
                 let normal_weight = if has_normals {
                     if let (Some(n_i), Some(n_j)) = (p.normal, np.normal) {
                         let dot = n_i.dot(&n_j).clamp(-1.0, 1.0);
                         let angle_diff = (1.0 - dot).max(0.0);
-                        (-angle_diff * angle_diff / (2.0 * sigma_n * sigma_n)).exp().max(0.1)
+                        (-angle_diff * angle_diff / two_nn).exp().max(0.25)
                     } else {
                         1.0
                     }
@@ -1440,9 +1639,16 @@ fn bilateral_filter(pc: &PointCloud, sigma_s: f64, sigma_n: f64) -> Result<Point
                     1.0
                 };
 
-                let weight = spatial_weight * normal_weight;
+                let plane_residual_weight = if np_dist_to_plane <= 1e-12 {
+                    1.0
+                } else {
+                    (-np_dist_to_plane * np_dist_to_plane
+                        / (two_ss * 0.5)).exp()
+                };
 
-                sum_pos.coords += np.position.coords * weight;
+                let weight = spatial_weight * normal_weight * plane_residual_weight;
+
+                sum_pos.coords += np_projected * weight;
                 sum_weight += weight;
 
                 if let Some(n) = np.normal {
@@ -1458,6 +1664,20 @@ fn bilateral_filter(pc: &PointCloud, sigma_s: f64, sigma_n: f64) -> Result<Point
                 } else {
                     has_color = false;
                 }
+            }
+
+            let self_w = 1.5;
+            sum_pos.coords += projected * self_w;
+            sum_weight += self_w;
+            if let Some(n) = p.normal {
+                sum_normal += n * self_w;
+                sum_normal_weight += self_w;
+            }
+            if let Some(c) = p.color {
+                sum_r += c.r as f64 * self_w;
+                sum_g += c.g as f64 * self_w;
+                sum_b += c.b as f64 * self_w;
+                sum_color_weight += self_w;
             }
 
             let mut new_p = if sum_weight > 1e-12 {
